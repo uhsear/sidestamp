@@ -1610,6 +1610,16 @@ def self_test():
     check(args.sample == 5, "--sample defaults to five ids a group")
     check(_parse(["--streets", "s", "--rules", "r", "--apply"]).apply is True,
           "--apply is read")
+    # A prefix of the write flag must not reach it. Without allow_abbrev=False,
+    # "--ap" would be read as "--apply" and write the report.
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            _parse(["--streets", "s", "--rules", "r", "--ap"])
+        prefix_refused = False
+    except SystemExit:
+        prefix_refused = True
+    check(prefix_refused, "a unique prefix of --apply is refused by the parser"
+          "  <-- pinned defect")
     check(_parse(["--streets", "s", "--rules", "r", "--dense"]).dense is True,
           "--dense is read")
     check(_parse(["--self-test"]).self_test is True, "--self-test is read")
@@ -1808,6 +1818,7 @@ def self_test():
 def _parse(argv):
     ap = argparse.ArgumentParser(
         prog="sidestamp.py",
+        allow_abbrev=False,
         description="Check each side of a centerline against the polygon that "
                     "side actually fronts.",
         epilog="Nothing is written without --apply. Exit codes: 0 clean and "

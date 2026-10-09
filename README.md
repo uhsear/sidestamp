@@ -86,7 +86,7 @@ PASS  an absolute polygons path is read as given  <-- pinned defect
 PASS  a disabled rule does not need its layer to exist  <-- pinned defect
 PASS  a report that could not be written exits 2, not 1  <-- pinned defect
 ----------------------------------------------------------------------
-261 assertions, 0 failed
+262 assertions, 0 failed
 ```
 
 ## Requirements
