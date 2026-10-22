@@ -17,16 +17,23 @@ report a run clean when no segment in it had two different sides, because such
 a run cannot show that the probe reached the correct side at all.
 
 Why not a spatial join. ArcGIS Pro's Spatial Join and QGIS's Join Attributes by
-Location both relate a line to the polygons it touches, and Esri's Data Reviewer
-ships an attribute-to-containing-polygon check. All three are correct and fast
-for points. For a line they return the polygon it intersects, or the largest
-overlap, and neither of those is "the polygon on the left". The sided question
-needs a probe point on a side, and that is what this builds.
+Location both relate a line to the polygons it touches. Both are correct and
+fast for points. For a line they return every polygon it meets, the first one,
+or the one with the largest overlap, and none of those is "the polygon on the
+left". The sided question needs a probe point on a side, and that is what this
+builds.
 
     python sidestamp.py --self-test
     python sidestamp.py --streets streets.geojson --rules rules.json
     python sidestamp.py --streets streets.geojson --rules rules.json --dense
     python sidestamp.py --streets streets.geojson --rules rules.json --out report.json --apply
+    python sidestamp.py --points address_points.geojson --rules point_rules.json
+
+Points mode checks the one value stamped on each address point against the
+polygon the point sits in. A point has no sides, so the sign check has no
+meaning there. A smaller refusal takes its place: when the agreeing points of a
+rule all sit in one polygon, a stamp read from the wrong column or checked
+against the wrong layer would print the same report, so the run exits 3.
 
 Exit codes: 0 the run was clean and could have failed, 1 findings at ERROR or a
 flipped probe, 2 an input could not be read, 3 the run proved nothing, 64 usage
@@ -94,14 +101,21 @@ TIER_KEYS = {
 }
 
 RULE_KEYS = frozenset([
-    "id", "label", "left_field", "right_field", "polygons", "polygon_field",
-    "outside_default", "placeholder", "enabled",
+    "id", "label", "left_field", "right_field", "point_field", "polygons",
+    "polygon_field", "outside_default", "placeholder", "enabled",
     "severity", "placeholder_severity", "blank_severity",
 ])
 
 REQUIRED_RULE_KEYS = ("id", "left_field", "right_field", "polygon_field")
+REQUIRED_POINT_KEYS = ("id", "point_field", "polygon_field")
 
-SIDE_LABEL = {"L": "left", "R": "right"}
+# Distinct polygon values the agreeing points of one rule must front before a
+# points run can be called clean. One value is the case that proves nothing.
+MIN_DISTINCT = 2
+
+# How a message names where a stamp sits. "P" is the points mode, where a stamp
+# belongs to a location and there is no road to be left or right of.
+SIDE_LABEL = {"L": "left side", "R": "right side", "P": "point"}
 
 
 # ----------------------------------------------------------------- pure core
@@ -277,6 +291,20 @@ def containing_value(polys, point):
     return None
 
 
+def containing_values(polys, point):
+    """Every distinct value of the polygons containing the point.
+
+    Empty when the point is inside no polygon. A point exactly on a shared
+    boundary lies in both polygons, and the first-match rule of
+    containing_value would then accept only one of two correct stamps. Points
+    mode keeps them all, so that either stamp agrees.
+    """
+    px, py = point
+    return set(_clean(value).upper()
+               for value, rings_list in polys
+               for rings in rings_list if point_in_polygon(px, py, rings))
+
+
 def side_values(polys, coords, offset, side, dense, chord=DEFAULT_CHORD):
     """Every distinct polygon value the given side fronts.
 
@@ -332,21 +360,21 @@ def describe_side(field, side, stored, values, gaps, layer_label,
         if outside_default is None:
             if stored == "":
                 return None, "gap"
-            return ("%s side is inside no %s; stored %s '%s'"
+            return ("%s is inside no %s; stored %s '%s'"
                     % (SIDE_LABEL[side], layer_label, field, stored), "mismatch")
         if stored == "":
-            return ("%s is blank but the %s side is outside every %s, which is '%s'"
+            return ("%s is blank but the %s is outside every %s, which is '%s'"
                     % (field, SIDE_LABEL[side], layer_label, outside_default),
                     "blank")
         if stored != outside_default:
-            return ("%s '%s' != %s on the %s side, which is outside every "
+            return ("%s '%s' != %s on the %s, which is outside every "
                     "polygon and so '%s'"
                     % (field, stored, layer_label, SIDE_LABEL[side],
                        outside_default), "mismatch")
         return None, None
 
     if stored == "":
-        return ("%s is blank but the %s side is inside %s '%s'"
+        return ("%s is blank but the %s is inside %s '%s'"
                 % (field, SIDE_LABEL[side], layer_label,
                    "' or '".join(sorted(values))), "blank")
 
@@ -360,11 +388,11 @@ def describe_side(field, side, stored, values, gaps, layer_label,
         # Part of this side is uncovered and the rest names one polygon. Still
         # a mismatch, but say the side is partly uncovered so nobody hunts for
         # a polygon that does not exist.
-        return ("%s '%s' != %s on the %s side '%s', and %d sample(s) of that "
+        return ("%s '%s' != %s on the %s '%s', and %d sample(s) of that "
                 "side are inside no polygon"
                 % (field, stored, layer_label, SIDE_LABEL[side],
                    sorted(values)[0], gaps), "mismatch")
-    return ("%s '%s' != %s on the %s side '%s'"
+    return ("%s '%s' != %s on the %s '%s'"
             % (field, stored, layer_label, SIDE_LABEL[side],
                "' or '".join(sorted(values))), "mismatch")
 
@@ -435,7 +463,7 @@ def evaluate(streets, rules, polys_by_rule, offset=DEFAULT_OFFSET, dense=False,
                         "rule": rule["id"], "oid": street["oid"], "side": side,
                         "field": field, "label": label, "stored": stored,
                         "values": sorted(values), "defensible": defensible,
-                        "desc": "%s side spans %d %s polygons (%s) and is "
+                        "desc": "%s spans %d %s polygons (%s) and is "
                                 "stamped '%s', which is %s of them; split the "
                                 "centerline at the boundary"
                                 % (SIDE_LABEL[side], len(values), label,
@@ -568,6 +596,30 @@ def agreement_rate(counts):
     return float(counts["agree"]) / decided
 
 
+def _findings_lines(report, noun):
+    """The findings count, severities and rollup groups, shared by both modes."""
+    out = []
+    by_sev = defaultdict(int)
+    for f in report["findings"]:
+        by_sev[f["severity"]] += 1
+    out.append("")
+    out.append("findings: %d" % len(report["findings"]))
+    for sev in SEVERITIES:
+        if by_sev[sev]:
+            out.append("  %-8s %d" % (sev, by_sev[sev]))
+
+    if report["rollup"]:
+        out.append("")
+        out.append("groups, largest first:")
+        for g in report["rollup"][:20]:
+            out.append("  %4d  %s %s stamped '%s' where the %s is '%s' [%s]"
+                       % (g["count"], g["rule"], g["field"], g["stored"], noun,
+                          g["containing"], g["tier"]))
+            out.append("        sample ids: %s"
+                       % ", ".join(str(o) for o in g["sample_ids"]))
+    return out
+
+
 def describe(report, dense):
     """The printed report, as a list of lines."""
     counts = dict(report["counts"])
@@ -598,24 +650,7 @@ def describe(report, dense):
                    "span, so the stamp is defensible and the split is still "
                    "owed" % counts["ambiguous_defensible"])
 
-    by_sev = defaultdict(int)
-    for f in report["findings"]:
-        by_sev[f["severity"]] += 1
-    out.append("")
-    out.append("findings: %d" % len(report["findings"]))
-    for sev in SEVERITIES:
-        if by_sev[sev]:
-            out.append("  %-8s %d" % (sev, by_sev[sev]))
-
-    if report["rollup"]:
-        out.append("")
-        out.append("groups, largest first:")
-        for g in report["rollup"][:20]:
-            out.append("  %4d  %s %s stamped '%s' where the side is '%s' [%s]"
-                       % (g["count"], g["rule"], g["field"], g["stored"],
-                          g["containing"], g["tier"]))
-            out.append("        sample ids: %s"
-                       % ", ".join(str(o) for o in g["sample_ids"]))
+    out.extend(_findings_lines(report, "side"))
 
     if report["ambiguous"]:
         out.append("")
@@ -644,6 +679,140 @@ def describe(report, dense):
     return out
 
 
+# ------------------------------------------------------------------ points core
+
+def require_fields(points, rules):
+    """Refuse a run whose points lack a field a rule reads.
+
+    A point with no such property reads as blank, so a misspelled field name,
+    or a layer exported without the column, looks like a layer of unstamped
+    addresses. The blank tier then fires on every point, or the conservative
+    miss swallows them all. A key that is present and null is a real blank and
+    passes. Raises ValueError, naming the rule, the field and the first ids.
+    """
+    for rule in rules:
+        if not rule.get("enabled", True):
+            continue
+        field = rule["point_field"]
+        missing = [p["oid"] for p in points if field not in p["props"]]
+        if missing:
+            raise ValueError(
+                "rule %s: point field '%s' is missing from %d of %d point(s), "
+                "first ids: %s. A point without the field reads as blank, so "
+                "the whole layer would look unstamped. Fix the field name in "
+                "the rules or export the column."
+                % (rule["id"], field, len(missing), len(points),
+                   ", ".join(str(m) for m in missing[:3])))
+
+
+def evaluate_points(points, rules, polys_by_rule):
+    """Run every enabled point rule over every point. Returns a report dict.
+
+    Pure, like evaluate(). A point is checked by containment only: a point
+    outside every polygon is outside, and is never given the nearest polygon's
+    value. `evidence` maps each rule to the distinct polygon values its
+    AGREEING points front; a point that disagrees proves nothing about whether
+    the lookup can tell places apart.
+    """
+    findings = []
+    counts = {"points": 0, "compared": 0, "agree": 0, "gap": 0, "skipped": 0,
+              "boundary": 0}
+    active = [r for r in rules if r.get("enabled", True)]
+    seen = dict((r["id"], set()) for r in active)
+    for point in points:
+        counts["points"] += 1
+        if point["xy"] is None:
+            counts["skipped"] += 1
+            continue
+        for rule in active:
+            values = containing_values(polys_by_rule[rule["id"]], point["xy"])
+            field = rule["point_field"]
+            stored = _clean(point["props"].get(field)).upper()
+            outside = rule.get("outside_default")
+            label = rule.get("label") or rule["polygon_field"]
+            counts["compared"] += 1
+            if len(values) > 1:
+                counts["boundary"] += 1
+            desc, tier = describe_side(field, "P", stored, values,
+                                       0 if values else 1, label, outside,
+                                       rule.get("placeholder"))
+            if tier == "gap":
+                counts["gap"] += 1
+            elif desc is None:
+                counts["agree"] += 1
+                # The stamp itself, which an agreeing point has shown to name
+                # a polygon it is in. On a shared boundary that is the one the
+                # stamp chose, not the first the layer lists.
+                seen[rule["id"]].add(stored)
+            else:
+                findings.append({
+                    "rule": rule["id"], "oid": point["oid"], "side": "P",
+                    "field": field, "label": label, "stored": stored,
+                    "containing": _effective(values, outside),
+                    "tier": tier, "desc": desc,
+                    "severity": rule.get(TIER_KEYS[tier]) or rule["severity"],
+                })
+    evidence = dict((rid, sorted(vals)) for rid, vals in seen.items())
+    return {"mode": "points", "findings": findings, "counts": counts,
+            "evidence": evidence, "rollup": rollup(findings)}
+
+
+def evidence_verdicts(evidence):
+    """Rule id -> "PASS" or "INSUFFICIENT".
+
+    A rule passes when its agreeing points front MIN_DISTINCT or more distinct
+    values. With fewer, a stamp read from the wrong column, or checked against
+    a layer that holds only that one polygon, prints the same report.
+    """
+    return dict((rid, "PASS" if len(vals) >= MIN_DISTINCT else "INSUFFICIENT")
+                for rid, vals in evidence.items())
+
+
+def gate_points(report):
+    """Exit code for a finished points run: 1 outranks 3, and 3 outranks 0."""
+    if any(f["severity"] == "ERROR" for f in report["findings"]):
+        return 1
+    if "INSUFFICIENT" in evidence_verdicts(report["evidence"]).values():
+        return 3
+    return 0
+
+
+def describe_points(report):
+    """The printed points report, as a list of lines."""
+    counts = report["counts"]
+    out = ["points read: %d" % counts["points"]]
+    if counts["skipped"]:
+        out.append("  %d skipped: no location (null or empty geometry, or a "
+                   "NaN or infinite coordinate)" % counts["skipped"])
+    out.append("stamps compared: %d" % counts["compared"])
+    decided = counts["agree"] + len(report["findings"])
+    if decided == 0:
+        out.append("  agreement rate: none, no stamp was decided")
+    else:
+        out.append("  agreement: %d of %d decided stamps, %.2f%%"
+                   % (counts["agree"], decided,
+                      100.0 * counts["agree"] / decided))
+    out.append("  conservative misses: %d blank stamps where the layer covers "
+               "nothing" % counts["gap"])
+    if counts["boundary"]:
+        out.append("  %d stamp(s) on a shared boundary, where either polygon's "
+                   "value is accepted" % counts["boundary"])
+    out.extend(_findings_lines(report, "point"))
+    verdicts = evidence_verdicts(report["evidence"])
+    out.append("")
+    out.append("discrimination check: %s" % (
+        "INSUFFICIENT" if "INSUFFICIENT" in verdicts.values() else "PASS"))
+    for rid in sorted(verdicts):
+        vals = report["evidence"][rid]
+        out.append("  %s: agreeing points front %d distinct value(s) (%s), "
+                   "%d needed [%s]" % (rid, len(vals), ", ".join(vals) or "none",
+                                       MIN_DISTINCT, verdicts[rid]))
+    if "INSUFFICIENT" in verdicts.values():
+        out.append("  A rule marked INSUFFICIENT would print the same report "
+                   "for a stamp read from the wrong column.")
+    return out
+
+
 # ------------------------------------------------------------------ rules i/o
 
 def validate_rule(raw):
@@ -662,7 +831,12 @@ def validate_rule(raw):
     if unknown:
         raise ValueError("rule %s: unknown key(s) %s. Valid keys: %s"
                          % (rid, ", ".join(unknown), ", ".join(sorted(RULE_KEYS))))
-    for key in REQUIRED_RULE_KEYS:
+    is_point = "point_field" in raw
+    if is_point and ("left_field" in raw or "right_field" in raw):
+        raise ValueError("rule %s: 'point_field' checks a point and "
+                         "'left_field'/'right_field' check a road, so one rule "
+                         "cannot hold both" % rid)
+    for key in (REQUIRED_POINT_KEYS if is_point else REQUIRED_RULE_KEYS):
         if not raw.get(key):
             raise ValueError("rule %s: '%s' is required" % (rid, key))
     rule = dict(raw)
@@ -692,7 +866,7 @@ def validate_rule(raw):
         rule["placeholder"] = _clean(rule["placeholder"]).upper()
     if rule.get("outside_default") is not None:
         rule["outside_default"] = _clean(rule["outside_default"]).upper()
-    if rule["left_field"] == rule["right_field"]:
+    if not is_point and rule["left_field"] == rule["right_field"]:
         raise ValueError("rule %s: left_field and right_field are both '%s', so "
                          "the two sides cannot disagree" % (rid, rule["left_field"]))
     return rule
@@ -723,7 +897,18 @@ def load_rules(obj):
                              "them would be reported under the other's name"
                              % rule["id"])
         seen[rule["id"]] = True
+    if len(set(rules_kind([r]) for r in rules)) > 1:
+        # A run reads one kind of layer. Running half of a mixed file and
+        # saying nothing about the other half is a check switched off quietly.
+        raise ValueError("rules file: it mixes road checks (left_field and "
+                         "right_field) with point checks (point_field). Split "
+                         "it into one file per layer kind.")
     return rules
+
+
+def rules_kind(rules):
+    """"points" when the rules hold point checks, otherwise "sided"."""
+    return "points" if "point_field" in rules[0] else "sided"
 
 
 # ---------------------------------------------------------------- geojson i/o
@@ -766,13 +951,57 @@ def streets_from_geojson(obj, id_field=None):
             raise ValueError("feature %d has geometry type %r, expected "
                              "LineString" % (i, gtype))
         coords = [(float(c[0]), float(c[1])) for c in geom.get("coordinates") or []]
-        if id_field:
-            oid = props.get(id_field)
-            if oid is None:
-                raise ValueError("feature %d has no '%s' property" % (i, id_field))
-        else:
-            oid = feat.get("id", props.get("OBJECTID", i + 1))
-        out.append({"oid": oid, "coords": coords, "props": props})
+        out.append({"oid": _oid(feat, props, i, id_field), "coords": coords,
+                    "props": props})
+    return out
+
+
+def _oid(feat, props, i, id_field):
+    """The id a feature is reported under."""
+    if id_field:
+        oid = props.get(id_field)
+        if oid is None:
+            raise ValueError("feature %d has no '%s' property" % (i, id_field))
+        return oid
+    return feat.get("id", props.get("OBJECTID", i + 1))
+
+
+def points_from_geojson(obj, id_field=None):
+    """Points as {"oid", "xy", "props"}. `xy` is None for an unlocated feature.
+
+    RFC 7946 section 3.2 lets a Feature carry a null geometry when it is
+    unlocated, and section 3.1 lets a processor read an empty coordinates array
+    as null. Address layers hold such records (an address awaiting a location),
+    so they are kept and counted rather than refused. A coordinate that is NaN
+    or infinite is the same fact: Python's json module accepts those literals,
+    and a NaN point is inside no polygon, which would read as a coverage gap.
+    A MultiPoint is refused, like a MultiLineString: it has no single location.
+    """
+    out = []
+    for i, feat in enumerate(_features(obj)):
+        props = feat.get("properties") or {}
+        geom = feat.get("geometry")
+        xy = None
+        if geom is not None:
+            if not isinstance(geom, dict):
+                raise ValueError("feature %d: geometry must be an object or "
+                                 "null, got %s" % (i, type(geom).__name__))
+            if geom.get("type") != "Point":
+                raise ValueError(
+                    "feature %d has geometry type %r, expected Point. Explode a "
+                    "MultiPoint first: it has no single location."
+                    % (i, geom.get("type")))
+            coords = geom.get("coordinates") or []
+            if len(coords) >= 2:
+                try:
+                    pair = (float(coords[0]), float(coords[1]))
+                except (TypeError, ValueError):
+                    raise ValueError("feature %d has a coordinate that is not "
+                                     "a number" % i)
+                if all(math.isfinite(v) for v in pair):
+                    xy = pair
+        out.append({"oid": _oid(feat, props, i, id_field), "xy": xy,
+                    "props": props})
     return out
 
 
@@ -834,29 +1063,62 @@ def read_json(path):
 
 # ------------------------------------------------------------------ self-test
 
-def self_test():
-    """Assertions over the decision core. No file outside a temp dir, no
-    network, no credentials, no arcpy."""
-    passed = [0]
-    failed = []
+class _Harness(object):
+    """The self-test's counter. A class, so the self-test can run a second one
+    over deliberate failures and prove the first would have reported them."""
 
-    def check(cond, label):
+    def __init__(self):
+        self.passed = 0
+        self.failed = []
+
+    def check(self, cond, label):
         if cond:
-            passed[0] += 1
+            self.passed += 1
             print("PASS  %s" % label)
         else:
-            failed.append(label)
+            self.failed.append(label)
             print("FAIL  %s" % label)
 
-    def raises(fn, label):
+    def raises(self, fn, label):
         try:
             fn()
         except ValueError:
-            check(True, label)
+            self.check(True, label)
         except Exception as exc:
-            check(False, "%s (wrong exception %r)" % (label, exc))
+            self.check(False, "%s (wrong exception %r)" % (label, exc))
         else:
-            check(False, "%s (no error raised)" % label)
+            self.check(False, "%s (no error raised)" % label)
+
+    def finish(self):
+        """Print the footer and return the exit code."""
+        print("-" * 70)
+        total = self.passed + len(self.failed)
+        if self.failed:
+            print("%d assertions, %d failed" % (total, len(self.failed)))
+            for item in self.failed:
+                print("  FAILED: %s" % item)
+            return 1
+        print("%d assertions, 0 failed" % total)
+        return 0
+
+
+def _refused(argv):
+    """True when the parser exits instead of returning arguments."""
+    refused = False
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            _parse(argv)
+    except SystemExit:
+        refused = True
+    return refused
+
+
+def self_test():
+    """Assertions over the decision core. No file outside a temp dir, no
+    network, no credentials, no arcpy."""
+    harness = _Harness()
+    check = harness.check
+    raises = harness.raises
 
     print("sidestamp self-test: no file, no network, no arcpy")
     print("-" * 70)
@@ -1164,17 +1426,18 @@ def self_test():
     # The tier severity cannot be switched off on its own. Telling an analyst
     # to write "placeholder_severity: off" would send them to a knob that does
     # not exist, and leave the rule emitting at full volume.
+    refusal = ""
     try:
         load_rules({"checks": [{"id": "SIDE-ZIP", "left_field": "L",
                                 "right_field": "R", "polygon_field": "Z",
                                 "placeholder_severity": "off"}]})
-        check(False, "switching off a tier severity is refused  <-- pinned defect")
     except ValueError as exc:
-        check("SIDE-ZIP emits those records" in str(exc),
-              "switching off a tier severity is refused  <-- pinned defect")
-        check("\"enabled\": false" in str(exc),
-              "and the refusal names the knob that does work")
-        check("INFO" in str(exc), "and names demotion as the other way out")
+        refusal = str(exc)
+    check("SIDE-ZIP emits those records" in refusal,
+          "switching off a tier severity is refused  <-- pinned defect")
+    check("\"enabled\": false" in refusal,
+          "and the refusal names the knob that does work")
+    check("INFO" in refusal, "and names demotion as the other way out")
 
     bare = load_rules([{"id": "A", "left_field": "L", "right_field": "R",
                         "polygon_field": "Z"}])
@@ -1612,13 +1875,8 @@ def self_test():
           "--apply is read")
     # A prefix of the write flag must not reach it. Without allow_abbrev=False,
     # "--ap" would be read as "--apply" and write the report.
-    try:
-        with contextlib.redirect_stderr(io.StringIO()):
-            _parse(["--streets", "s", "--rules", "r", "--ap"])
-        prefix_refused = False
-    except SystemExit:
-        prefix_refused = True
-    check(prefix_refused, "a unique prefix of --apply is refused by the parser"
+    check(_refused(["--streets", "s", "--rules", "r", "--ap"]),
+          "a unique prefix of --apply is refused by the parser"
           "  <-- pinned defect")
     check(_parse(["--streets", "s", "--rules", "r", "--dense"]).dense is True,
           "--dense is read")
@@ -1637,6 +1895,309 @@ def self_test():
           "--sample is read")
     check(_parse(["--streets", "a", "--rules", "r", "--id-field", "SEGID"]).id_field
           == "SEGID", "--id-field is read")
+
+    # ---- points mode: parsing
+    def pt(oid, xy, props):
+        geometry = None if xy is None else {"type": "Point",
+                                            "coordinates": list(xy)}
+        return {"type": "Feature", "id": oid, "properties": props,
+                "geometry": geometry}
+
+    def points_fc(features):
+        return {"type": "FeatureCollection", "features": features}
+
+    got = points_from_geojson(points_fc([pt(1, (3.0, 4.0), {"ZIP": "34475"})]))
+    check(got[0]["oid"] == 1 and got[0]["xy"] == (3.0, 4.0),
+          "a Point feature is read as its id and its x, y")
+    got = points_from_geojson(points_fc([pt(2, (3.0, 4.0, 90.0), {})]))
+    check(got[0]["xy"] == (3.0, 4.0),
+          "a third element, the elevation, is dropped and the position kept")
+    got = points_from_geojson(points_fc([pt(3, None, {}),
+                                         pt(4, (), {})]))
+    check([g["xy"] for g in got] == [None, None],
+          "an unlocated feature and an empty position are kept with no "
+          "location, not refused  <-- pinned defect")
+    nan_doc = json.loads('{"type": "FeatureCollection", "features": ['
+                         '{"id": 5, "properties": {}, "geometry": {"type": '
+                         '"Point", "coordinates": [NaN, 5]}},'
+                         '{"id": 6, "properties": {}, "geometry": {"type": '
+                         '"Point", "coordinates": [5, Infinity]}}]}')
+    got = points_from_geojson(nan_doc)
+    check([g["xy"] for g in got] == [None, None],
+          "a NaN or infinite coordinate, which json.load accepts, is an "
+          "unlocated point and not a coverage gap  <-- pinned defect")
+    raises(lambda: points_from_geojson(points_fc([
+        {"geometry": {"type": "MultiPoint", "coordinates": [[0, 0]]},
+         "properties": {}}])),
+           "a MultiPoint is refused, not flattened  <-- pinned defect")
+    raises(lambda: points_from_geojson(points_fc([
+        {"geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]},
+         "properties": {}}])),
+           "a line in the points layer is refused")
+    raises(lambda: points_from_geojson(points_fc([
+        {"geometry": [0, 0], "properties": {}}])),
+           "a geometry that is neither an object nor null is refused")
+    raises(lambda: points_from_geojson(points_fc([
+        {"geometry": {"type": "Point", "coordinates": ["x", 1]},
+         "properties": {}}])),
+           "a coordinate that is text is refused")
+    raises(lambda: points_from_geojson(points_fc([
+        {"geometry": {"type": "Point", "coordinates": [None, 1]},
+         "properties": {}}])),
+           "and a null coordinate is refused too")
+    got = points_from_geojson(points_fc([
+        {"properties": {"SEGID": "A9"}, "geometry": {
+            "type": "Point", "coordinates": [1, 1]}}]), id_field="SEGID")
+    check(got[0]["oid"] == "A9", "--id-field names the property a point is reported by")
+    raises(lambda: points_from_geojson(points_fc([pt(7, (1.0, 1.0), {})]),
+                                       id_field="SEGID"),
+           "a point missing the --id-field property is refused")
+    got = points_from_geojson(points_fc([
+        {"geometry": {"type": "Point", "coordinates": [1, 1]}}]))
+    check(got[0]["oid"] == 1 and got[0]["props"] == {},
+          "a point with no properties is numbered from one and has none")
+
+    # ---- points mode: rules
+    prules = load_rules({"checks": [{
+        "id": "PT-ZIP", "label": "ZIP", "point_field": "ZIP",
+        "polygons": "zips.geojson", "polygon_field": "ZIP",
+        "placeholder": "99999"}]})
+    check(rules_kind(prules) == "points" and prules[0]["severity"] == "ERROR",
+          "a point rule is a points rule and defaults to ERROR")
+    check(rules_kind([zips]) == "sided", "a left and right rule is a sided rule")
+    raises(lambda: load_rules({"checks": [{
+        "id": "A", "point_field": "ZIP", "left_field": "ZIP_L",
+        "polygon_field": "ZIP"}]}),
+           "a rule reading both a point field and a side field is refused"
+           "  <-- pinned defect")
+    raises(lambda: load_rules({"checks": [
+        {"id": "A", "point_field": "ZIP", "polygon_field": "ZIP"},
+        {"id": "B", "left_field": "L", "right_field": "R",
+         "polygon_field": "Z"}]}),
+           "a rules file mixing point and road rules is refused, not half run"
+           "  <-- pinned defect")
+    raises(lambda: load_rules({"checks": [{"id": "A", "point_field": "ZIP"}]}),
+           "a point rule with no polygon_field is refused")
+    raises(lambda: load_rules({"checks": [{
+        "id": "A", "point_field": "", "polygon_field": "ZIP"}]}),
+           "a point rule with an empty point_field is refused")
+
+    # ---- points mode: the required-field assertion
+    located = points_from_geojson(points_fc([
+        pt(1, (-100.0, 0.0), {"ZIP": "34482"}),
+        pt(2, (100.0, 0.0), {"ZIP": None}),
+        pt(3, (100.0, 5.0), {"ZIPCODE": "34475"}),
+        pt(4, (100.0, 6.0), {})]))
+    refusal = ""
+    try:
+        require_fields(located, prules)
+    except ValueError as exc:
+        refusal = str(exc)
+    check("PT-ZIP" in refusal and "'ZIP'" in refusal and "2 of 4" in refusal,
+          "a point layer missing the field a rule reads is refused, naming "
+          "the rule, the field and the count  <-- pinned defect")
+    check("first ids: 3, 4" in refusal, "and the first ids to open")
+    check(require_fields(located[:2], prules) is None,
+          "a field present and null passes, because null is a real blank")
+    off_point = dict(prules[0])
+    off_point["enabled"] = False
+    check(require_fields(located, [off_point]) is None,
+          "and a disabled rule is not asked for its field")
+
+    # ---- points mode: the run
+    def prun(features, rules=None, layer=None):
+        rules = prules if rules is None else rules
+        found = points_from_geojson(points_fc(features))
+        return evaluate_points(
+            found, rules,
+            dict((r["id"], zip_layer if layer is None else layer)
+                 for r in rules))
+
+    pa = pt(1, (-100.0, 0.0), {"ZIP": "34482"})
+    pb = pt(2, (100.0, 0.0), {"ZIP": "34475"})
+    rep = prun([pa, pb])
+    check(not rep["findings"] and rep["counts"]["agree"] == 2,
+          "two correctly stamped points in two ZIPs agree")
+    check(rep["evidence"] == {"PT-ZIP": ["34475", "34482"]},
+          "and the evidence is the two ZIPs the agreeing points front")
+    check(evidence_verdicts(rep["evidence"]) == {"PT-ZIP": "PASS"},
+          "two distinct values pass the discrimination check")
+    check(gate_points(rep) == 0, "so the run exits 0")
+
+    rep = prun([pa, pt(3, (-200.0, 10.0), {"ZIP": "34482"})])
+    check(not rep["findings"] and rep["counts"]["agree"] == 2,
+          "two points in one ZIP, both stamped right, agree")
+    check(evidence_verdicts(rep["evidence"]) == {"PT-ZIP": "INSUFFICIENT"},
+          "but they front one value, so the check is INSUFFICIENT"
+          "  <-- pinned defect")
+    check(gate_points(rep) == 3,
+          "a clean points run that could not have failed exits 3, not 0"
+          "  <-- pinned defect")
+    rep = prun([])
+    check(rep["counts"]["points"] == 0 and gate_points(rep) == 3,
+          "an empty points file proves nothing and exits 3")
+
+    rep = prun([pa, pb, pt(4, (-100.0, 50.0), {"ZIP": "34475"})])
+    f = rep["findings"][0]
+    check(len(rep["findings"]) == 1 and f["tier"] == "mismatch" and
+          f["containing"] == "34482" and f["side"] == "P",
+          "a point stamped 34475 inside 34482 is one mismatch  <-- pinned defect")
+    check(f["desc"] == "ZIP '34475' != ZIP on the point '34482'",
+          "and its text names the point, not a side of a road")
+    check(f["severity"] == "ERROR" and gate_points(rep) == 1,
+          "a genuine mismatch is an ERROR and exits 1")
+
+    rep = prun([pa, pb, pt(5, (100.0, 9.0), {"ZIP": "99999"})])
+    check(rep["findings"][0]["tier"] == "placeholder" and
+          rep["findings"][0]["severity"] == "WARNING",
+          "the 99999 placeholder is its own tier at WARNING, as on a road")
+    check(gate_points(rep) == 0,
+          "and a placeholder alone does not fail a run that could have failed")
+    rep = prun([pa, pt(5, (100.0, 9.0), {"ZIP": "99999"})])
+    check(gate_points(rep) == 3,
+          "but a placeholder is not evidence, so one agreeing ZIP and one "
+          "placeholder exits 3  <-- pinned defect")
+
+    warn = dict(prules[0])
+    warn["severity"] = "WARNING"
+    rep = prun([pa, pt(6, (100.0, 0.0), {"ZIP": "34482"})], rules=[warn])
+    check(len(rep["findings"]) == 1 and gate_points(rep) == 3,
+          "a mismatched point is not evidence either, so a WARNING mismatch "
+          "beside one agreeing ZIP exits 3, not 0  <-- pinned defect")
+
+    rep = prun([pa, pb, pt(7, (100.0, 3.0), {"ZIP": None})])
+    check(rep["findings"][0]["tier"] == "blank",
+          "a null stamp inside a ZIP is the blank tier")
+    rep = prun([pt(8, (1000.0, 1000.0), {"ZIP": ""})])
+    check(rep["counts"]["gap"] == 1 and not rep["findings"] and
+          rep["counts"]["agree"] == 0,
+          "a blank stamp outside every polygon is a conservative miss, "
+          "counted apart")
+
+    # No distance cap and no nearest-polygon fallback. A point is inside a
+    # polygon or it is not, and a stamp on a point outside every polygon is
+    # wrong however close the edge is.
+    for oid, x in ((9, 501.0), (10, 5000.0)):
+        rep = prun([pt(oid, (x, 0.0), {"ZIP": "34475"})])
+        check(len(rep["findings"]) == 1 and
+              rep["findings"][0]["tier"] == "mismatch" and
+              rep["findings"][0]["containing"] is None and
+              "inside no ZIP" in rep["findings"][0]["desc"],
+              "a point %g unit(s) outside the layer, stamped with the nearest "
+              "ZIP, is a mismatch and not an agreement  <-- pinned defect"
+              % (x - 500.0))
+    check(rep["rollup"][0]["containing"] == "(outside all)",
+          "and it rolls up under (outside all)")
+
+    rep = prun([pt(11, (0.0, 0.0), {"ZIP": "34475"}),
+                pt(12, (0.0, 1.0), {"ZIP": "34482"})])
+    check(not rep["findings"] and rep["counts"]["boundary"] == 2,
+          "a point exactly on a shared boundary accepts either stamp, and "
+          "is counted as on one  <-- pinned defect")
+    rep = prun([pt(13, (0.0, 0.0), {"ZIP": "34479"})])
+    check("34475' or '34482" in rep["findings"][0]["desc"],
+          "and a third stamp there fails naming both polygons")
+    check(rep["evidence"]["PT-ZIP"] == [],
+          "a failed point adds no evidence")
+    rep = prun([pt(14, (0.0, 0.0), {"ZIP": "34482"}), pa])
+    check(rep["evidence"]["PT-ZIP"] == ["34482"],
+          "an agreeing boundary point is evidence for the stamp it chose, "
+          "not the first polygon the layer lists")
+
+    rep = prun([pt(15, None, {"ZIP": "34475"}), pa, pb])
+    check(rep["counts"]["skipped"] == 1 and rep["counts"]["compared"] == 2,
+          "an unlocated point is skipped and counted, not compared")
+
+    pmuni = load_rules({"checks": [{
+        "id": "PT-MUNI", "label": "municipality", "point_field": "MUNI",
+        "polygons": "muni.geojson", "polygon_field": "MUNI",
+        "outside_default": "unincorporated"}]})
+    rep = prun([pt(16, (-100.0, 0.0), {"MUNI": "riverton"}),
+                pt(17, (9000.0, 0.0), {"MUNI": "UNINCORPORATED"})],
+               rules=pmuni, layer=muni_mixed)
+    check(gate_points(rep) == 0 and rep["evidence"]["PT-MUNI"] ==
+          ["RIVERTON", "UNINCORPORATED"],
+          "outside every polygon counts as a distinct value when the layer "
+          "declares what outside means")
+    rep = prun([pt(18, (9000.0, 0.0), {"MUNI": ""})],
+               rules=pmuni, layer=muni_mixed)
+    check(rep["findings"][0]["tier"] == "blank",
+          "and a blank point outside every polygon fires, as a blank side does")
+
+    one_muni = polygons_from_geojson(points_fc(
+        [poly("RIVERTON", -500.0, -500.0, 500.0, 500.0, "MUNI")]), "MUNI")
+    two_rules = prules + pmuni
+    found_two = points_from_geojson(points_fc([
+        pt(19, (-100.0, 0.0), {"ZIP": "34482", "MUNI": "RIVERTON"}),
+        pt(20, (100.0, 0.0), {"ZIP": "34475", "MUNI": "RIVERTON"})]))
+    rep = evaluate_points(found_two, two_rules,
+                          {"PT-ZIP": zip_layer, "PT-MUNI": one_muni})
+    check(evidence_verdicts(rep["evidence"]) ==
+          {"PT-ZIP": "PASS", "PT-MUNI": "INSUFFICIENT"},
+          "each rule is judged on its own evidence")
+    check(gate_points(rep) == 3,
+          "so one rule that could not have failed exits the run 3"
+          "  <-- pinned defect")
+    ptext = "\n".join(describe_points(rep))
+    check("PT-MUNI: agreeing points front 1 distinct value(s) (RIVERTON), "
+          "2 needed [INSUFFICIENT]" in ptext,
+          "the report names the rule that lacked evidence and what it saw")
+    check("wrong column" in ptext, "and says why in words")
+    rep = prun([pa, pb, pt(21, None, {}), pt(22, (0.0, 0.0), {"ZIP": "34475"})])
+    ptext = "\n".join(describe_points(rep))
+    check("1 skipped: no location" in ptext, "a skipped point is reported")
+    check("1 stamp(s) on a shared boundary" in ptext,
+          "and so is a boundary stamp")
+    check("discrimination check: PASS" in ptext and "[PASS]" in ptext,
+          "a run with evidence reports PASS")
+    check("agreement: 3 of 3 decided stamps, 100.00%" in ptext,
+          "and its agreement rate")
+    rep = prun([pt(23, (1000.0, 0.0), {"ZIP": ""})])
+    check("agreement rate: none" in "\n".join(describe_points(rep)),
+          "a run that decided no stamp has no agreement rate")
+    rep = prun([pa, pb] + [pt(30 + i, (-100.0, 50.0), {"ZIP": "34475"})
+                           for i in range(3)])
+    check(rep["rollup"][0]["count"] == 3 and
+          "stamped '34475' where the point is '34482' [mismatch]" in
+          "\n".join(describe_points(rep)),
+          "three identical mismatches roll up into one group, worded as a "
+          "point")
+
+    # ---- the self-test's own counter must be able to fail
+    meta = _Harness()
+    sink = io.StringIO()
+    with contextlib.redirect_stdout(sink):
+        meta.check(False, "a false condition")
+        meta.raises(lambda: None, "no error")
+        meta.raises(lambda: 1 // 0, "wrong error")
+        meta.raises(lambda: int("q"), "right error")
+        meta_code = meta.finish()
+    check(meta_code == 1 and len(meta.failed) == 3 and meta.passed == 1,
+          "the counter records a false condition, a missing error and a wrong "
+          "error as three failures and a raised ValueError as a pass"
+          "  <-- pinned defect")
+    check("4 assertions, 3 failed" in sink.getvalue() and
+          "FAILED: wrong error" in sink.getvalue(),
+          "and its footer counts them and names each failure")
+
+    # ---- points mode: argument parsing
+    check(_parse(["--points", "p", "--rules", "r"]).points == "p",
+          "--points is read")
+    check(_parse(["--streets", "s", "--rules", "r"]).points is None,
+          "--points defaults to nothing")
+    check(_refused(["--points", "p", "--rules", "r", "--po"]),
+          "a unique prefix of --points is refused by the parser"
+          "  <-- pinned defect")
+    check(_refused(["--points", "p", "--rules", "r", "--out", "o", "--appl"]),
+          "and a longer prefix of --apply is refused too  <-- pinned defect")
+    check(_parse(["--streets", "s", "--rules", "r"]).given_offset is False,
+          "an offset left at its default is not marked as typed")
+    check(_parse(["--streets", "s", "--rules", "r", "--offset", "10"])
+          .given_offset is True,
+          "an offset typed with the default's value is marked as typed"
+          "  <-- pinned defect")
+    check(_parse(["--streets", "s", "--rules", "r", "--chord", "1"])
+          .given_chord is True, "and so is a chord")
 
     # ---- the cli, end to end, against files in a temp directory
     tmp = tempfile.mkdtemp(prefix="sidestamp_")
@@ -1799,49 +2360,149 @@ def self_test():
                        "--apply"]) == 2,
               "a report that could not be written exits 2, not 1"
               "  <-- pinned defect")
+
+        # ---- points mode, end to end
+        prules_path = put("prules.json", {"checks": [{
+            "id": "PT-ZIP", "label": "ZIP", "point_field": "ZIP",
+            "polygons": "zips.geojson", "polygon_field": "ZIP",
+            "placeholder": "99999"}]})
+        pts_ok = put("pts_ok.geojson", points_fc([pa, pb]))
+        pts_flat = put("pts_flat.geojson", points_fc([
+            pa, pt(3, (-200.0, 10.0), {"ZIP": "34482"})]))
+        pts_bad = put("pts_bad.geojson", points_fc([
+            pa, pb, pt(4, (-100.0, 50.0), {"ZIP": "34475"})]))
+        pts_nofield = put("pts_nofield.geojson", points_fc([
+            pt(1, (-100.0, 0.0), {"ZIPCODE": "34482"})]))
+        pts_multi = put("pts_multi.geojson", {"type": "FeatureCollection",
+                                              "features": [{
+            "properties": {}, "geometry": {"type": "MultiPoint",
+                                           "coordinates": [[0, 0]]}}]})
+
+        def run_pts(extra):
+            return run_main(["--points"] + extra)
+
+        check(run_pts([pts_ok, "--rules", prules_path]) == 0,
+              "points mode over files on disk exits 0 when it could have failed")
+        check(run_pts([pts_flat, "--rules", prules_path]) == 3,
+              "points that front one polygon exit 3  <-- pinned defect")
+        check(run_pts([pts_bad, "--rules", prules_path]) == 1,
+              "a mismatched point exits 1")
+        check(run_pts([pts_nofield, "--rules", prules_path]) == 2,
+              "a points file missing the rule's field exits 2, not a clean "
+              "run of blanks  <-- pinned defect")
+        check(run_pts([pts_multi, "--rules", prules_path]) == 2,
+              "a MultiPoint file exits 2")
+        check(run_pts([os.path.join(tmp, "nope.geojson"), "--rules",
+                       prules_path]) == 2, "an unreadable points file exits 2")
+        check(run_pts([pts_ok, "--rules", prules_path,
+                       "--id-field", "OBJECTID"]) == 2,
+              "--id-field naming a property no point carries exits 2")
+        check(run_pts([pts_ok, "--rules", prules_path, "--sample", "2"]) == 0,
+              "--sample runs in points mode")
+        check(run_pts([pts_ok, "--rules", prules_path, "--dense"]) == 64,
+              "--dense in points mode is refused, not ignored  <-- pinned defect")
+        check(run_pts([pts_ok, "--rules", prules_path, "--offset", "5"]) == 64,
+              "--offset in points mode is refused  <-- pinned defect")
+        check(run_pts([pts_ok, "--rules", prules_path, "--offset", "10"]) == 64,
+              "and typing the default offset is still refused"
+              "  <-- pinned defect")
+        check(run_pts([pts_ok, "--rules", prules_path, "--chord", "1"]) == 64,
+              "--chord in points mode is refused")
+        check(run_main(["--points", pts_ok, "--streets", clean_path,
+                        "--rules", prules_path]) == 64,
+              "--streets and --points together are refused")
+        check(run_pts([pts_ok, "--rules", rules_path]) == 64,
+              "road rules run with --points are refused  <-- pinned defect")
+        check(run_cli([clean_path, "--rules", prules_path]) == 64,
+              "point rules run with --streets are refused  <-- pinned defect")
+        check(run_pts([pts_ok, "--rules", prules_path, "--apply"]) == 64,
+              "--apply without --out is a usage error in points mode too")
+        pts_out = os.path.join(tmp, "points_report.json")
+        check(run_pts([pts_bad, "--rules", prules_path, "--out", pts_out]) == 1
+              and not os.path.exists(pts_out),
+              "--out without --apply writes nothing in points mode"
+              "  <-- pinned defect")
+        check(run_pts([pts_bad, "--rules", prules_path, "--out", pts_out,
+                       "--apply"]) == 1 and os.path.exists(pts_out),
+              "--apply writes the points report")
+        with open(pts_out, "r", encoding="utf-8") as handle:
+            written = json.load(handle)
+        check(written["mode"] == "points" and
+              written["evidence"] == {"PT-ZIP": ["34475", "34482"]} and
+              len(written["findings"]) == 1 and written["rollup"],
+              "and it carries the mode, the evidence, the findings and the "
+              "rollup")
+
+        # Points mode has no offset, so lat/lon data is not at risk of a
+        # ten-unit step through 690 miles of somewhere else.
+        put("dzips.geojson", {"type": "FeatureCollection", "features": [
+            poly("34482", -82.30, 29.0, -82.15, 29.4),
+            poly("34475", -82.15, 29.0, -82.00, 29.4)]})
+        drules = put("drules.json", {"checks": [{
+            "id": "PT-ZIP", "point_field": "ZIP", "polygons": "dzips.geojson",
+            "polygon_field": "ZIP"}]})
+        dpts = put("dpts.geojson", points_fc([
+            pt(1, (-82.20, 29.2), {"ZIP": "34482"}),
+            pt(2, (-82.05, 29.2), {"ZIP": "34475"})]))
+        check(run_pts([dpts, "--rules", drules]) == 0,
+              "lat/lon points run without a geographic refusal, since there "
+              "is no offset to misapply")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    print("-" * 70)
-    total = passed[0] + len(failed)
-    if failed:
-        print("%d assertions, %d failed" % (total, len(failed)))
-        for item in failed:
-            print("  FAILED: %s" % item)
-        return 1
-    print("%d assertions, 0 failed" % total)
-    return 0
+    return harness.finish()
 
 
 # ----------------------------------------------------------------------- cli
+
+class _Given(argparse.Action):
+    """Store a value and note that the flag was typed.
+
+    A default equal to the typed value is still a choice. Points mode refuses
+    --offset and --chord because it has no probe, and comparing the value with
+    the default would let `--offset 10` through.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "given_" + self.dest, True)
+
 
 def _parse(argv):
     ap = argparse.ArgumentParser(
         prog="sidestamp.py",
         allow_abbrev=False,
-        description="Check each side of a centerline against the polygon that "
-                    "side actually fronts.",
+        description="Check each side of a centerline, or the stamp on each "
+                    "address point, against the polygon it actually fronts.",
         epilog="Nothing is written without --apply. Exit codes: 0 clean and "
                "provable, 1 findings, 2 unreadable input, 3 the run proved "
                "nothing, 64 usage error.",
     )
     ap.add_argument("--streets", help="GeoJSON of single part LineString "
                                       "centerlines carrying the sided fields")
-    ap.add_argument("--rules", help="JSON file describing the sided checks")
+    ap.add_argument("--points", help="GeoJSON of Point address points carrying "
+                                     "the stamped field. Use instead of "
+                                     "--streets, with point rules.")
+    ap.add_argument("--rules", help="JSON file describing the checks")
     ap.add_argument("--offset", type=float, default=DEFAULT_OFFSET,
+                    action=_Given,
                     help="distance stepped perpendicular to reach a probe "
-                         "point, in the units of the data (default %.1f)"
-                         % DEFAULT_OFFSET)
+                         "point, in the units of the data (default %.1f). "
+                         "Streets only." % DEFAULT_OFFSET)
     ap.add_argument("--chord", type=float, default=DEFAULT_CHORD,
+                    action=_Given,
                     help="chord straddling the sample point used to measure "
-                         "the direction of travel (default %.1f)" % DEFAULT_CHORD)
+                         "the direction of travel (default %.1f). Streets "
+                         "only." % DEFAULT_CHORD)
+    ap.set_defaults(given_offset=False, given_chord=False)
     ap.add_argument("--dense", action="store_true",
                     help="sample nine points along each side instead of one. "
                          "Finds sides that span two polygons. Off by default "
-                         "because it is nine times the work.")
+                         "because it is nine times the work. Streets only.")
     ap.add_argument("--id-field", dest="id_field",
-                    help="street property to report segments by. Default: the "
-                         "GeoJSON feature id, then OBJECTID, then the position")
+                    help="street or point property to report features by. "
+                         "Default: the GeoJSON feature id, then OBJECTID, then "
+                         "the position")
     ap.add_argument("--sample", type=int, default=DEFAULT_SAMPLE,
                     help="sample OBJECTIDs carried per rollup group "
                          "(default %d)" % DEFAULT_SAMPLE)
@@ -1853,19 +2514,25 @@ def _parse(argv):
     return ap.parse_args(argv)
 
 
+def _usage(message):
+    print("error: %s" % message, file=sys.stderr)
+    return 64
+
+
 def main(argv=None):
     args = _parse(sys.argv[1:] if argv is None else argv)
 
     if args.self_test:
         return self_test()
 
-    if not args.streets:
-        print("error: --streets is required. Use --self-test to verify the "
-              "tool without data.", file=sys.stderr)
-        return 64
+    if args.streets and args.points:
+        return _usage("--streets and --points are two modes. Pick one.")
+    if not args.streets and not args.points:
+        return _usage("--streets is required (or --points, for address "
+                      "points). Use --self-test to verify the tool without "
+                      "data.")
     if not args.rules:
-        print("error: --rules is required.", file=sys.stderr)
-        return 64
+        return _usage("--rules is required.")
     # Every comparison below one of these is False for a NaN, so a NaN slips
     # through a bare `<= 0` test and lands in the arithmetic, where it produces
     # a probe point of (nan, nan). That point is inside no polygon, so the run
@@ -1875,17 +2542,19 @@ def main(argv=None):
     # instead of a report built from nothing.
     for flag, value in (("--offset", args.offset), ("--chord", args.chord)):
         if not (value > 0.0) or value in (float("inf"), float("-inf")):
-            print("error: %s must be a finite number greater than zero. A zero "
-                  "offset probes the centerline itself, which is on neither "
-                  "side, and a NaN or an infinity probes nothing at all."
-                  % flag, file=sys.stderr)
-            return 64
+            return _usage("%s must be a finite number greater than zero. A "
+                          "zero offset probes the centerline itself, which is "
+                          "on neither side, and a NaN or an infinity probes "
+                          "nothing at all." % flag)
     if args.sample < 1:
-        print("error: --sample must be at least 1.", file=sys.stderr)
-        return 64
+        return _usage("--sample must be at least 1.")
     if args.apply and not args.out:
-        print("error: --apply needs --out.", file=sys.stderr)
-        return 64
+        return _usage("--apply needs --out.")
+    points_mode = bool(args.points)
+    if points_mode and (args.dense or args.given_offset or args.given_chord):
+        return _usage("--dense, --offset and --chord belong to the road probe. "
+                      "A point has no sides, so points mode has nothing for "
+                      "them to do.")
 
     try:
         raw_rules = read_json(args.rules)
@@ -1900,47 +2569,76 @@ def main(argv=None):
     try:
         rules = load_rules(raw_rules)
     except ValueError as exc:
-        print("error: %s" % exc, file=sys.stderr)
-        return 64
+        return _usage(str(exc))
+    if (rules_kind(rules) == "points") != points_mode:
+        return _usage("the rules hold %s checks. Run them with %s."
+                      % (("road", "--streets") if points_mode
+                         else ("point", "--points")))
 
     rules_dir = os.path.dirname(os.path.abspath(args.rules))
     polys_by_rule = {}
     try:
-        streets = streets_from_geojson(read_json(args.streets), args.id_field)
+        if points_mode:
+            features = points_from_geojson(read_json(args.points),
+                                           args.id_field)
+        else:
+            features = streets_from_geojson(read_json(args.streets),
+                                            args.id_field)
         for rule in rules:
             if not rule.get("enabled", True):
                 polys_by_rule[rule["id"]] = []
                 continue
             if not rule.get("polygons"):
-                print("error: rule %s has no 'polygons' path, so there is "
-                      "nothing to compare against." % rule["id"], file=sys.stderr)
-                return 64
+                return _usage("rule %s has no 'polygons' path, so there is "
+                              "nothing to compare against." % rule["id"])
             # Relative to the rules file, so a rules file and its layers move
             # together. os.path.join leaves an absolute path alone.
             path = os.path.join(rules_dir, rule["polygons"])
             polys_by_rule[rule["id"]] = polygons_from_geojson(
                 read_json(path), rule["polygon_field"])
+        if points_mode:
+            require_fields(features, rules)
     except (IOError, OSError, ValueError) as exc:
         # Geometry this tool cannot probe is an unreadable input, not a usage
         # error. The operator's command line was fine; the data is not.
         print("error: %s" % exc, file=sys.stderr)
         return 2
 
-    if looks_geographic(streets) and args.offset >= GEOGRAPHIC_OFFSET_LIMIT:
-        # A ten unit offset in degrees is about 690 miles. The run would
-        # complete, report every side as inside no polygon or inside the wrong
-        # one, and look like a data problem.
-        print("error: the streets look like lat/lon degrees and --offset is "
-              "%g, which is about %d miles. Reproject to a projected system in "
-              "feet or metres, or pass an offset in degrees."
-              % (args.offset, int(args.offset * 69)), file=sys.stderr)
-        return 64
+    if points_mode:
+        report = evaluate_points(features, rules, polys_by_rule)
+        report["rollup"] = rollup(report["findings"], args.sample)
+        lines = describe_points(report)
+        code = gate_points(report)
+        verdicts = {
+            0: "PASS: every stamp agrees, and the agreeing points front more "
+               "than one value per rule, so the run could have failed.",
+            3: "INSUFFICIENT: no stamp disagreed, and the points could not "
+               "have shown a wrong column or a wrong layer. This is not a "
+               "clean run.",
+            1: "FAIL: stamps disagree with the polygons the points fall in."}
+    else:
+        if looks_geographic(features) and args.offset >= GEOGRAPHIC_OFFSET_LIMIT:
+            # A ten unit offset in degrees is about 690 miles. The run would
+            # complete, report every side as inside no polygon or inside the
+            # wrong one, and look like a data problem.
+            return _usage("the streets look like lat/lon degrees and --offset "
+                          "is %g, which is about %d miles. Reproject to a "
+                          "projected system in feet or metres, or pass an "
+                          "offset in degrees."
+                          % (args.offset, int(args.offset * 69)))
+        report = evaluate(features, rules, polys_by_rule, args.offset,
+                          args.dense, args.chord)
+        report["rollup"] = rollup(report["findings"], args.sample)
+        lines = describe(report, args.dense)
+        code = gate(report)
+        verdicts = {
+            0: "PASS: every side agrees, and the run contained segments that "
+               "could have shown otherwise.",
+            3: "INSUFFICIENT: no side disagreed, and no segment in this run "
+               "could have disagreed. This is not a clean run.",
+            1: "FAIL: sides disagree with the polygons they front."}
 
-    report = evaluate(streets, rules, polys_by_rule, args.offset, args.dense,
-                      args.chord)
-    report["rollup"] = rollup(report["findings"], args.sample)
-
-    for line in describe(report, args.dense):
+    for line in lines:
         print(line)
 
     if args.out:
@@ -1957,18 +2655,10 @@ def main(argv=None):
             print("\nCheck only. %s was not written. Re-run with --apply."
                   % args.out)
 
-    code = gate(report)
     print("")
-    if code == 0:
-        print("PASS: every side agrees, and the run contained segments that "
-              "could have shown otherwise.")
-    elif code == 3:
-        print("INSUFFICIENT: no side disagreed, and no segment in this run "
-              "could have disagreed. This is not a clean run.")
-    else:
-        print("FAIL: sides disagree with the polygons they front.")
+    print(verdicts[code])
     return code
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     sys.exit(main())
