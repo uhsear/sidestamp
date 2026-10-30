@@ -5,8 +5,8 @@ A centerline has no single containing polygon. It runs BETWEEN them, and it
 carries a separate attribute for each side: a left ZIP and a right ZIP, a left
 ESN and a right ESN, a left city and a right city. Point-in-polygon validation
 answers a question the geometry cannot answer, so it never finds the road that
-runs along a ZIP boundary with both sides stamped 34475 while the west side
-fronts 34482.
+runs along a ZIP boundary with both sides stamped 10001 while the west side
+fronts 10003.
 
 This steps perpendicular from the segment's midpoint to the left and to the
 right of the direction of travel, finds the polygon containing each probe
@@ -113,6 +113,10 @@ REQUIRED_POINT_KEYS = ("id", "point_field", "polygon_field")
 # points run can be called clean. One value is the case that proves nothing.
 MIN_DISTINCT = 2
 
+# The exit code for a mistake in the command line or the rules file, as opposed
+# to 2, which means an input file could not be read.
+EXIT_USAGE = 64
+
 # How a message names where a stamp sits. "P" is the points mode, where a stamp
 # belongs to a location and there is no road to be left or right of.
 SIDE_LABEL = {"L": "left side", "R": "right side", "P": "point"}
@@ -126,7 +130,7 @@ def _clean(value):
     None, an empty cell and a cell holding only spaces are the same fact: no
     value. A number arrives as a number from JSON and as text from a shapefile,
     so both are compared as text. A float that is a whole number prints its
-    trailing .0, and ZIP 34475.0 would never equal ZIP 34475.
+    trailing .0, and ZIP 10001.0 would never equal ZIP 10001.
     """
     if value is None:
         return ""
@@ -180,7 +184,7 @@ def side_points(coords, offset, fraction=0.5, chord=DEFAULT_CHORD):
     Returns (left_xy, right_xy), or None when no direction can be measured.
 
     Left of travel is the +90 degree (counter-clockwise) normal (-dy, dx). That
-    is the handedness NG911 gives LEFT and RIGHT: standing at the from node and
+    is the usual address range convention: standing at the from node and
     looking toward the to node, left is the LEFT side. Get this backwards and
     every finding is real, every finding is on the wrong side, and the report
     looks plausible. The sign check exists to catch exactly that.
@@ -400,9 +404,9 @@ def describe_side(field, side, stored, values, gaps, layer_label,
 def _effective(values, outside_default):
     """The containing value a rollup groups by, or None when there is none.
 
-    Called only for a side that fronts at most one polygon. A side fronting
-    several is reported ambiguous instead of grouped, because a rollup row
-    naming two polygons is not a unit of work.
+    Called for a side that fronts at most one polygon, and for a point, which
+    can sit on a shared boundary. evaluate() groups a side that spans several
+    polygons under all of them instead.
     """
     if not values:
         return outside_default
@@ -476,14 +480,17 @@ def evaluate(streets, rules, polys_by_rule, offset=DEFAULT_OFFSET, dense=False,
                 if desc is None:
                     counts["agree"] += 1
                     continue
-                if spans and tier in ("mismatch", "blank"):
-                    # No single right answer to name, so no verdict. The
-                    # ambiguous record above already carries the remedy.
-                    continue
+                # A stamp that is none of the polygons the side fronts is wrong
+                # whether the side fronts one polygon or two, so it is a
+                # finding either way. A spanning side has no single containing
+                # value to name, so it groups under all of them. Dropping it
+                # here once let a provably wrong stamp exit 0.
                 findings.append({
                     "rule": rule["id"], "oid": street["oid"], "side": side,
                     "field": field, "label": label, "stored": stored,
-                    "containing": _effective(values, rule.get("outside_default")),
+                    "containing": (" / ".join(sorted(values)) if spans else
+                                   _effective(values,
+                                              rule.get("outside_default"))),
                     "tier": tier, "desc": desc,
                     "severity": rule.get(TIER_KEYS[tier]) or rule["severity"],
                 })
@@ -522,7 +529,7 @@ def _tally_sign(sign, street, rule, probes):
 def rollup(findings, sample=DEFAULT_SAMPLE):
     """Collapse findings into the groups an analyst fixes at once.
 
-    One row saying 96 sides fronting ZIP 34482 are stamped 34475 is the unit of
+    One row saying 96 sides fronting ZIP 10003 are stamped 10001 is the unit of
     work. Sorted by count descending, so systematic drift sits above the
     one-off boundary segments.
     """
@@ -654,7 +661,7 @@ def describe(report, dense):
 
     if report["ambiguous"]:
         out.append("")
-        out.append("ambiguous sides, no verdict given:")
+        out.append("sides spanning more than one polygon, split owed:")
         for a in report["ambiguous"][:10]:
             out.append("  OBJECTID %s %s: %s" % (a["oid"], a["rule"], a["desc"]))
 
@@ -768,11 +775,21 @@ def evidence_verdicts(evidence):
                 for rid, vals in evidence.items())
 
 
+def points_proved_nothing(evidence):
+    """True when no rule ran, or any rule that ran lacked evidence.
+
+    With every rule disabled the evidence is empty, so no rule can be marked
+    INSUFFICIENT and a bare any() would call the run clean. A run that checked
+    no stamp has proved nothing.
+    """
+    return not evidence or "INSUFFICIENT" in evidence_verdicts(evidence).values()
+
+
 def gate_points(report):
     """Exit code for a finished points run: 1 outranks 3, and 3 outranks 0."""
     if any(f["severity"] == "ERROR" for f in report["findings"]):
         return 1
-    if "INSUFFICIENT" in evidence_verdicts(report["evidence"]).values():
+    if points_proved_nothing(report["evidence"]):
         return 3
     return 0
 
@@ -801,7 +818,10 @@ def describe_points(report):
     verdicts = evidence_verdicts(report["evidence"])
     out.append("")
     out.append("discrimination check: %s" % (
-        "INSUFFICIENT" if "INSUFFICIENT" in verdicts.values() else "PASS"))
+        "INSUFFICIENT" if points_proved_nothing(report["evidence"])
+        else "PASS"))
+    if not verdicts:
+        out.append("  No rule was enabled, so no stamp was checked.")
     for rid in sorted(verdicts):
         vals = report["evidence"][rid]
         out.append("  %s: agreeing points front %d distinct value(s) (%s), "
@@ -839,6 +859,12 @@ def validate_rule(raw):
     for key in (REQUIRED_POINT_KEYS if is_point else REQUIRED_RULE_KEYS):
         if not raw.get(key):
             raise ValueError("rule %s: '%s' is required" % (rid, key))
+    if not isinstance(raw.get("enabled", True), bool):
+        # A null or a string is not false. rule.get("enabled", True) would
+        # read a null as off and a string as on, so a template left with
+        # "enabled": null switched the rule off and the run read clean.
+        raise ValueError("rule %s: 'enabled' must be true or false, got %r"
+                         % (rid, raw["enabled"]))
     rule = dict(raw)
     rule.setdefault("severity", "ERROR")
     rule.setdefault("placeholder_severity", "WARNING")
@@ -1230,6 +1256,25 @@ def self_test():
           "put on the line reads as on it  <-- pinned defect")
     check(point_on_ring(5.0, 0.0, square[0]),
           "and the edge itself still reads as on it")
+    # Every edge above runs along an axis through the origin, so the cross
+    # product never saw a first vertex with a non-zero x or a diagonal. A sign
+    # slip in either term survived the whole suite.
+    diamond = [(1000.0, 1005.0), (1005.0, 1000.0), (1010.0, 1005.0),
+               (1005.0, 1010.0)]
+    check(point_on_ring(1002.5, 1002.5, diamond),
+          "a point on a diagonal edge whose first vertex has a large x is on "
+          "it  <-- pinned defect")
+    check(not point_on_ring(1002.5, 1003.5, diamond),
+          "and a point one unit beside that diagonal is not")
+    check(not point_on_ring(1007.5, 997.5, diamond),
+          "nor is a point on the diagonal's line but past its end")
+    check(point_in_polygon(1002.0, 1005.0, [diamond]),
+          "a probe level with a vertex, with the polygon to its right, is "
+          "inside  <-- pinned defect")
+    check(not point_in_polygon(995.0, 1005.0, [diamond]),
+          "and one level with that vertex but outside is not")
+    check(point_in_polygon(1008.0, 1005.0, [diamond]),
+          "and one level with the far vertex is inside too")
     # "Within ON_EDGE_EPS" includes the tolerance itself. A producer that
     # rounds a shared boundary to the last representable digit puts its points
     # at the tolerance, not inside it, and an exclusive test would drop exactly
@@ -1265,9 +1310,9 @@ def self_test():
 
     # ---- _clean, the normalization every comparison depends on
     check(_clean(None) == "", "a null value cleans to empty")
-    check(_clean("  34475 ") == "34475", "a padded value is stripped")
-    check(_clean(34475) == "34475", "an integer cleans to its digits")
-    check(_clean(34475.0) == "34475",
+    check(_clean("  10001 ") == "10001", "a padded value is stripped")
+    check(_clean(10001) == "10001", "an integer cleans to its digits")
+    check(_clean(10001.0) == "10001",
           "a float ZIP loses its trailing .0, or it never equals the text ZIP"
           "  <-- pinned defect")
     check(_clean(1.5) == "1.5", "a genuine fraction keeps its decimal part")
@@ -1293,7 +1338,7 @@ def self_test():
     check(containing_value([("Riverton", [square])], (5.0, 5.0)) == "RIVERTON",
           "a mixed case polygon value is folded up to match the stored side"
           "  <-- pinned defect")
-    check(containing_value([("  34475 ", [square])], (5.0, 5.0)) == "34475",
+    check(containing_value([("  10001 ", [square])], (5.0, 5.0)) == "10001",
           "and a padded one is stripped by the same normalizer")
 
     # ---- _effective: what the rollup groups a finding under
@@ -1301,7 +1346,7 @@ def self_test():
           "a side inside no polygon groups under the layer's outside default")
     check(_effective(set(), None) is None,
           "and under nothing when the layer has no outside default")
-    check(_effective(set(["34482", "34475"]), None) == "34475",
+    check(_effective(set(["10003", "10001"]), None) == "10001",
           "a side fronting two polygons groups under the lowest, so a "
           "placeholder on an ambiguous side still lands in one stable group")
 
@@ -1338,26 +1383,26 @@ def self_test():
                              rule["label"], rule.get("outside_default"),
                              rule.get("placeholder"))
 
-    check(side(zips, "34475", ["34475"]) == (None, None),
+    check(side(zips, "10001", ["10001"]) == (None, None),
           "a side stamped with the ZIP it fronts agrees")
-    desc, tier = side(zips, "34475", ["34482"])
-    check(tier == "mismatch" and "34482" in desc,
-          "a side stamped 34475 fronting 34482 is a mismatch  <-- pinned defect")
+    desc, tier = side(zips, "10001", ["10003"])
+    check(tier == "mismatch" and "10003" in desc,
+          "a side stamped 10001 fronting 10003 is a mismatch  <-- pinned defect")
     check("left" in desc, "the finding names which side is wrong")
-    desc, tier = side(zips, "99999", ["34482"])
+    desc, tier = side(zips, "99999", ["10003"])
     check(tier == "placeholder",
           "the 99999 placeholder is its own tier, not a wrong ZIP"
           "  <-- pinned defect")
     check("placeholder" in desc, "the placeholder finding says so in words")
     check(side(zips, "99999", ["99999"])[1] == "placeholder",
           "a placeholder is a placeholder even where a polygon carries it")
-    desc, tier = side(zips, "", ["34482"])
+    desc, tier = side(zips, "", ["10003"])
     check(tier == "blank", "a blank field the polygon can name is the blank tier")
     check(side(zips, "", [])[1] == "gap",
           "a blank field where the layer covers nothing is a conservative miss"
           "  <-- pinned defect")
     check(side(zips, "", [])[0] is None, "and it carries no finding text")
-    desc, tier = side(zips, "34475", [])
+    desc, tier = side(zips, "10001", [])
     check(tier == "mismatch" and "inside no" in desc,
           "a stamped side fronting no polygon at all is a mismatch")
 
@@ -1380,14 +1425,14 @@ def self_test():
           "stamped with the city it is inside agrees")
 
     # ---- dense acceptance: a side fronting two ZIPs accepts either
-    check(side(zips, "34475", ["34475", "34482"]) == (None, None),
+    check(side(zips, "10001", ["10001", "10003"]) == (None, None),
           "a nine sample sweep fronting two ZIPs accepts the first")
-    check(side(zips, "34482", ["34475", "34482"]) == (None, None),
+    check(side(zips, "10003", ["10001", "10003"]) == (None, None),
           "and accepts the second")
-    desc, tier = side(zips, "34479", ["34475", "34482"])
-    check(tier == "mismatch" and "34475' or '34482" in desc,
+    desc, tier = side(zips, "10002", ["10001", "10003"])
+    check(tier == "mismatch" and "10001' or '10003" in desc,
           "a value fronting neither fails and names both  <-- pinned defect")
-    desc, tier = side(zips, "34479", ["34482"], gaps=4)
+    desc, tier = side(zips, "10002", ["10003"], gaps=4)
     check(tier == "mismatch" and "4 sample(s)" in desc,
           "a partly uncovered side says so rather than naming a missing polygon")
 
@@ -1473,22 +1518,22 @@ def self_test():
                              [list(c) for c in coords]}}
 
     # Two ZIP polygons meeting on the y axis. Every road below runs north along
-    # that seam, so its left side is 34482 and its right side is 34475.
+    # that seam, so its left side is 10003 and its right side is 10001.
     zip_layer = polygons_from_geojson(
         {"type": "FeatureCollection",
-         "features": [poly("34482", -500.0, -500.0, 0.0, 500.0),
-                      poly("34475", 0.0, -500.0, 500.0, 500.0)]}, "ZIP")
+         "features": [poly("10003", -500.0, -500.0, 0.0, 500.0),
+                      poly("10001", 0.0, -500.0, 500.0, 500.0)]}, "ZIP")
     check(len(zip_layer) == 2, "the fixture ZIP layer loaded two polygons")
-    check(containing_value(zip_layer, (-10.0, 0.0)) == "34482",
-          "west of the seam is 34482")
-    check(containing_value(zip_layer, (10.0, 0.0)) == "34475",
-          "east of the seam is 34475")
+    check(containing_value(zip_layer, (-10.0, 0.0)) == "10003",
+          "west of the seam is 10003")
+    check(containing_value(zip_layer, (10.0, 0.0)) == "10001",
+          "east of the seam is 10001")
 
     seam = [(0.0, -100.0), (0.0, 100.0)]
-    good = street(1, seam, {"ZIP_L": "34482", "ZIP_R": "34475"})
-    bad = street(2, seam, {"ZIP_L": "34475", "ZIP_R": "34475"})
-    holder = street(3, seam, {"ZIP_L": "99999", "ZIP_R": "34475"})
-    blank = street(4, seam, {"ZIP_L": "", "ZIP_R": "34475"})
+    good = street(1, seam, {"ZIP_L": "10003", "ZIP_R": "10001"})
+    bad = street(2, seam, {"ZIP_L": "10001", "ZIP_R": "10001"})
+    holder = street(3, seam, {"ZIP_L": "99999", "ZIP_R": "10001"})
+    blank = street(4, seam, {"ZIP_L": "", "ZIP_R": "10001"})
 
     def run(features, rule=zips, layer=None, **kw):
         streets = streets_from_geojson({"type": "FeatureCollection",
@@ -1511,8 +1556,8 @@ def self_test():
     # ground. A run with no offset argument must land inside.
     bands = polygons_from_geojson(
         {"type": "FeatureCollection",
-         "features": [poly("34482", -15.0, -500.0, -5.0, 500.0),
-                      poly("34475", 5.0, -500.0, 15.0, 500.0)]}, "ZIP")
+         "features": [poly("10003", -15.0, -500.0, -5.0, 500.0),
+                      poly("10001", 5.0, -500.0, 15.0, 500.0)]}, "ZIP")
     rep = run([good], layer=bands)
     check(rep["counts"]["agree"] == 2 and rep["counts"]["gap"] == 0,
           "the default offset lands inside a band ten units out"
@@ -1542,10 +1587,10 @@ def self_test():
 
     rep = run([bad])
     check(len(rep["findings"]) == 1,
-          "the road stamped 34475 on both sides has exactly one wrong side")
+          "the road stamped 10001 on both sides has exactly one wrong side")
     f = rep["findings"][0]
-    check(f["side"] == "L" and f["stored"] == "34475" and f["containing"] == "34482",
-          "and it is the left side, fronting 34482, stamped 34475"
+    check(f["side"] == "L" and f["stored"] == "10001" and f["containing"] == "10003",
+          "and it is the left side, fronting 10003, stamped 10001"
           "  <-- pinned defect")
     check(f["severity"] == "ERROR", "a genuine mismatch is an ERROR")
     check(gate(rep) == 1, "a run with an ERROR exits 1")
@@ -1575,20 +1620,20 @@ def self_test():
     check(gate(rep) == 1, "and the ERROR still decides the exit code")
 
     # ---- the rollup groups by containing/stored and sorts by count
-    many = [street(10 + i, seam, {"ZIP_L": "34475", "ZIP_R": "34475"})
+    many = [street(10 + i, seam, {"ZIP_L": "10001", "ZIP_R": "10001"})
             for i in range(6)]
     off_seam = [(300.0, -100.0), (300.0, 100.0)]
-    odd = [street(50, off_seam, {"ZIP_L": "34479", "ZIP_R": "34479"}),
-           street(51, off_seam, {"ZIP_L": "34479", "ZIP_R": "34479"})]
+    odd = [street(50, off_seam, {"ZIP_L": "10002", "ZIP_R": "10002"}),
+           street(51, off_seam, {"ZIP_L": "10002", "ZIP_R": "10002"})]
     rep = run(many + odd)
     groups = rep["rollup"]
     check(len(groups) == 3,
           "the left and right sides of the one-offs group separately, because "
           "they are different fields to fix")
-    check(groups[0]["count"] == 6 and groups[0]["stored"] == "34475",
+    check(groups[0]["count"] == 6 and groups[0]["stored"] == "10001",
           "the systematic drift of 6 sides sorts above the one-offs"
           "  <-- pinned defect")
-    check(groups[0]["containing"] == "34482",
+    check(groups[0]["containing"] == "10003",
           "and the group names the ZIP those sides actually front")
     check([g["count"] for g in groups[1:]] == [2, 2],
           "the one-off sides make two groups of two below it")
@@ -1603,7 +1648,7 @@ def self_test():
 
     # ---- a stamped side outside every polygon groups under "(outside all)"
     rep = run([street(85, [(10000.0, -100.0), (10000.0, 100.0)],
-                      {"ZIP_L": "34475", "ZIP_R": "34475"})])
+                      {"ZIP_L": "10001", "ZIP_R": "10001"})])
     check(len(rep["findings"]) == 2 and
           rep["findings"][0]["containing"] is None,
           "a stamped side outside every polygon has no containing value")
@@ -1616,7 +1661,7 @@ def self_test():
     check(rep["sign"]["discriminating"] == 1 and rep["sign"]["right_match"] == 1,
           "the seam road counts as one discriminating segment that matched")
     interior = [(100.0, -100.0), (100.0, 100.0)]
-    same = street(60, interior, {"ZIP_L": "34475", "ZIP_R": "34475"})
+    same = street(60, interior, {"ZIP_L": "10001", "ZIP_R": "10001"})
     rep = run([same] * 100)
     check(rep["sign"]["discriminating"] == 0,
           "100 segments with the same ZIP on both sides discriminate nothing"
@@ -1627,7 +1672,7 @@ def self_test():
     check(gate(rep) == 3,
           "a clean run that could not have failed exits 3, not 0"
           "  <-- pinned defect")
-    flipped = street(61, seam, {"ZIP_L": "34475", "ZIP_R": "34482"})
+    flipped = street(61, seam, {"ZIP_L": "10001", "ZIP_R": "10003"})
     rep = run([flipped])
     check(rep["sign"]["left_as_right"] == 1 and rep["sign"]["right_match"] == 0,
           "a road stamped with its sides swapped matches left as right")
@@ -1646,10 +1691,10 @@ def self_test():
     check(gate(rep) == 1,
           "this tie is gated at 1 anyway, because the swapped road is also an "
           "ERROR finding")
-    rep = run([street(62, seam, {"ZIP_L": "34482", "ZIP_R": ""})])
+    rep = run([street(62, seam, {"ZIP_L": "10003", "ZIP_R": ""})])
     check(rep["sign"]["discriminating"] == 0,
           "a segment with no stored right value cannot prove the sign either")
-    rep = run([street(63, seam, {"ZIP_L": "34482", "ZIP_R": "34479"})])
+    rep = run([street(63, seam, {"ZIP_L": "10003", "ZIP_R": "10002"})])
     check(rep["sign"]["discriminating"] == 1,
           "a right value naming neither side still counts as an opportunity")
     check(rep["sign"]["right_match"] == 0 and rep["sign"]["left_as_right"] == 0,
@@ -1675,10 +1720,10 @@ def self_test():
           "so a tied run with no ERROR exits 3, not 0  <-- pinned defect")
 
     # ---- ambiguity: a side spanning two polygons gets no verdict
-    # This road runs east along y=0 with 34482 to its west and 34475 to its
+    # This road runs east along y=0 with 10003 to its west and 10001 to its
     # east, so its NORTH (left) side spans both.
     crossing = street(70, [(-100.0, 0.0), (100.0, 0.0)],
-                      {"ZIP_L": "34482", "ZIP_R": "34482"})
+                      {"ZIP_L": "10003", "ZIP_R": "10003"})
     rep = run([crossing])
     check(rep["counts"]["ambiguous"] == 0,
           "a single midpoint sample cannot see that a side spans two polygons")
@@ -1698,7 +1743,7 @@ def self_test():
     # The same road stamped with a ZIP it fronts nowhere. Now there is no
     # single right answer to report, so it is ambiguous rather than a verdict.
     nowhere = street(71, [(-100.0, 5.0), (100.0, 5.0)],
-                     {"ZIP_L": "34479", "ZIP_R": "34479"})
+                     {"ZIP_L": "10002", "ZIP_R": "10002"})
     rep = run([nowhere], dense=True)
     check(rep["counts"]["ambiguous"] == 2 and
           rep["counts"]["ambiguous_defensible"] == 0,
@@ -1706,30 +1751,40 @@ def self_test():
           "not defensible  <-- pinned defect")
     check("which is neither of them" in rep["ambiguous"][0]["desc"],
           "and the record says so")
-    check(rep["ambiguous"][0]["values"] == ["34475", "34482"],
+    check(rep["ambiguous"][0]["values"] == ["10001", "10003"],
           "and the record names the two polygons the side spans")
     check("split the centerline" in rep["ambiguous"][0]["desc"],
           "the ambiguous record carries the remedy, not a verdict"
           "  <-- pinned defect")
-    check(not rep["findings"],
-          "an ambiguous side produces no finding, right or wrong"
+    check(len(rep["findings"]) == 2 and
+          all(f["containing"] == "10001 / 10003" and f["tier"] == "mismatch"
+              for f in rep["findings"]),
+          "a stamp naming neither ZIP on a side spanning two is a finding, "
+          "grouped under both  <-- pinned defect")
+    check(gate(rep) == 1,
+          "so the run fails and does not exit 0 over a provably wrong stamp"
           "  <-- pinned defect")
+    defensible = run([crossing], dense=True)
+    check(not defensible["findings"] and gate(defensible) != 1,
+          "while a stamp naming one of the two stays defensible and quiet")
     check(rep["counts"]["sides"] == 2,
           "it was still compared, so it counts as a side compared")
     rep = run([nowhere])
     check(rep["counts"]["ambiguous"] == 0 and len(rep["findings"]) == 2,
           "the same road under a single sample reads as two plain mismatches")
     rep = run([street(72, [(-100.0, 5.0), (100.0, 5.0)], {})], dense=True)
-    check(rep["counts"]["ambiguous"] == 2,
-          "a blank side spanning two polygons is ambiguous, not a blank finding")
+    check(rep["counts"]["ambiguous"] == 2 and
+          [f["tier"] for f in rep["findings"]] == ["blank", "blank"],
+          "a blank side spanning two polygons is ambiguous and also a blank "
+          "finding  <-- pinned defect")
 
     # ---- skipped geometry is counted, never guessed
-    rep = run([street(80, [(50.0, 50.0), (50.0, 50.0)], {"ZIP_L": "34475"})])
+    rep = run([street(80, [(50.0, 50.0), (50.0, 50.0)], {"ZIP_L": "10001"})])
     check(rep["counts"]["skipped"] == 1 and rep["counts"]["sides"] == 0,
           "a zero length segment is skipped and counted  <-- pinned defect")
     check(rep["counts"]["segments"] == 1, "and still counts as a segment read")
     rep = run([street(81, [(0.0, -50.0), (0.0, 50.0), (0.0, -50.0)],
-                      {"ZIP_L": "34482", "ZIP_R": "34475"})])
+                      {"ZIP_L": "10003", "ZIP_R": "10001"})])
     check(rep["counts"]["skipped"] == 0 and rep["counts"]["unsampled"] == 2,
           "a spur that folds at its midpoint has length, so its two sides are "
           "counted unsampled rather than the segment skipped  <-- pinned defect")
@@ -1772,7 +1827,7 @@ def self_test():
           "would give the same answer" in insufficient,
           "an INSUFFICIENT run says why in words, not only in the exit code")
     unsettled = "\n".join(describe(
-        run([street(64, seam, {"ZIP_L": "34482", "ZIP_R": "34479"})]), dense=False))
+        run([street(64, seam, {"ZIP_L": "10003", "ZIP_R": "10002"})]), dense=False))
     check("settles the question" in unsettled,
           "an INSUFFICIENT run that had opportunities says why they failed")
     spur_text = "\n".join(describe(
@@ -1838,10 +1893,10 @@ def self_test():
          "properties": {"ZIP": "1"}}]}, "ZIP"),
            "a polygon layer holding only a two vertex ring is refused")
     multi = polygons_from_geojson({"type": "FeatureCollection", "features": [
-        {"properties": {"ZIP": "34475"}, "geometry": {"type": "MultiPolygon",
+        {"properties": {"ZIP": "10001"}, "geometry": {"type": "MultiPolygon",
          "coordinates": [[[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
                          [[[9, 9], [10, 9], [10, 10], [9, 10], [9, 9]]]]}}]}, "ZIP")
-    check(containing_value(multi, (9.5, 9.5)) == "34475",
+    check(containing_value(multi, (9.5, 9.5)) == "10001",
           "the second part of a MultiPolygon contains points too"
           "  <-- pinned defect")
     check(containing_value(multi, (5.0, 5.0)) is None,
@@ -1849,7 +1904,7 @@ def self_test():
 
     # ---- the geographic-coordinate refusal
     degrees = streets_from_geojson([{"properties": {}, "geometry": {
-        "type": "LineString", "coordinates": [[-82.14, 29.18], [-82.13, 29.19]]}}])
+        "type": "LineString", "coordinates": [[-20.14, 15.18], [-20.13, 15.19]]}}])
     check(looks_geographic(degrees), "lat/lon coordinates are detected")
     feet = streets_from_geojson([{"properties": {}, "geometry": {
         "type": "LineString", "coordinates": [[556000, 1600000], [556100, 1600100]]}}])
@@ -1906,7 +1961,7 @@ def self_test():
     def points_fc(features):
         return {"type": "FeatureCollection", "features": features}
 
-    got = points_from_geojson(points_fc([pt(1, (3.0, 4.0), {"ZIP": "34475"})]))
+    got = points_from_geojson(points_fc([pt(1, (3.0, 4.0), {"ZIP": "10001"})]))
     check(got[0]["oid"] == 1 and got[0]["xy"] == (3.0, 4.0),
           "a Point feature is read as its id and its x, y")
     got = points_from_geojson(points_fc([pt(2, (3.0, 4.0, 90.0), {})]))
@@ -1984,9 +2039,9 @@ def self_test():
 
     # ---- points mode: the required-field assertion
     located = points_from_geojson(points_fc([
-        pt(1, (-100.0, 0.0), {"ZIP": "34482"}),
+        pt(1, (-100.0, 0.0), {"ZIP": "10003"}),
         pt(2, (100.0, 0.0), {"ZIP": None}),
-        pt(3, (100.0, 5.0), {"ZIPCODE": "34475"}),
+        pt(3, (100.0, 5.0), {"ZIPCODE": "10001"}),
         pt(4, (100.0, 6.0), {})]))
     refusal = ""
     try:
@@ -2013,18 +2068,18 @@ def self_test():
             dict((r["id"], zip_layer if layer is None else layer)
                  for r in rules))
 
-    pa = pt(1, (-100.0, 0.0), {"ZIP": "34482"})
-    pb = pt(2, (100.0, 0.0), {"ZIP": "34475"})
+    pa = pt(1, (-100.0, 0.0), {"ZIP": "10003"})
+    pb = pt(2, (100.0, 0.0), {"ZIP": "10001"})
     rep = prun([pa, pb])
     check(not rep["findings"] and rep["counts"]["agree"] == 2,
           "two correctly stamped points in two ZIPs agree")
-    check(rep["evidence"] == {"PT-ZIP": ["34475", "34482"]},
+    check(rep["evidence"] == {"PT-ZIP": ["10001", "10003"]},
           "and the evidence is the two ZIPs the agreeing points front")
     check(evidence_verdicts(rep["evidence"]) == {"PT-ZIP": "PASS"},
           "two distinct values pass the discrimination check")
     check(gate_points(rep) == 0, "so the run exits 0")
 
-    rep = prun([pa, pt(3, (-200.0, 10.0), {"ZIP": "34482"})])
+    rep = prun([pa, pt(3, (-200.0, 10.0), {"ZIP": "10003"})])
     check(not rep["findings"] and rep["counts"]["agree"] == 2,
           "two points in one ZIP, both stamped right, agree")
     check(evidence_verdicts(rep["evidence"]) == {"PT-ZIP": "INSUFFICIENT"},
@@ -2037,12 +2092,12 @@ def self_test():
     check(rep["counts"]["points"] == 0 and gate_points(rep) == 3,
           "an empty points file proves nothing and exits 3")
 
-    rep = prun([pa, pb, pt(4, (-100.0, 50.0), {"ZIP": "34475"})])
+    rep = prun([pa, pb, pt(4, (-100.0, 50.0), {"ZIP": "10001"})])
     f = rep["findings"][0]
     check(len(rep["findings"]) == 1 and f["tier"] == "mismatch" and
-          f["containing"] == "34482" and f["side"] == "P",
-          "a point stamped 34475 inside 34482 is one mismatch  <-- pinned defect")
-    check(f["desc"] == "ZIP '34475' != ZIP on the point '34482'",
+          f["containing"] == "10003" and f["side"] == "P",
+          "a point stamped 10001 inside 10003 is one mismatch  <-- pinned defect")
+    check(f["desc"] == "ZIP '10001' != ZIP on the point '10003'",
           "and its text names the point, not a side of a road")
     check(f["severity"] == "ERROR" and gate_points(rep) == 1,
           "a genuine mismatch is an ERROR and exits 1")
@@ -2060,7 +2115,7 @@ def self_test():
 
     warn = dict(prules[0])
     warn["severity"] = "WARNING"
-    rep = prun([pa, pt(6, (100.0, 0.0), {"ZIP": "34482"})], rules=[warn])
+    rep = prun([pa, pt(6, (100.0, 0.0), {"ZIP": "10003"})], rules=[warn])
     check(len(rep["findings"]) == 1 and gate_points(rep) == 3,
           "a mismatched point is not evidence either, so a WARNING mismatch "
           "beside one agreeing ZIP exits 3, not 0  <-- pinned defect")
@@ -2078,7 +2133,7 @@ def self_test():
     # polygon or it is not, and a stamp on a point outside every polygon is
     # wrong however close the edge is.
     for oid, x in ((9, 501.0), (10, 5000.0)):
-        rep = prun([pt(oid, (x, 0.0), {"ZIP": "34475"})])
+        rep = prun([pt(oid, (x, 0.0), {"ZIP": "10001"})])
         check(len(rep["findings"]) == 1 and
               rep["findings"][0]["tier"] == "mismatch" and
               rep["findings"][0]["containing"] is None and
@@ -2089,22 +2144,22 @@ def self_test():
     check(rep["rollup"][0]["containing"] == "(outside all)",
           "and it rolls up under (outside all)")
 
-    rep = prun([pt(11, (0.0, 0.0), {"ZIP": "34475"}),
-                pt(12, (0.0, 1.0), {"ZIP": "34482"})])
+    rep = prun([pt(11, (0.0, 0.0), {"ZIP": "10001"}),
+                pt(12, (0.0, 1.0), {"ZIP": "10003"})])
     check(not rep["findings"] and rep["counts"]["boundary"] == 2,
           "a point exactly on a shared boundary accepts either stamp, and "
           "is counted as on one  <-- pinned defect")
-    rep = prun([pt(13, (0.0, 0.0), {"ZIP": "34479"})])
-    check("34475' or '34482" in rep["findings"][0]["desc"],
+    rep = prun([pt(13, (0.0, 0.0), {"ZIP": "10002"})])
+    check("10001' or '10003" in rep["findings"][0]["desc"],
           "and a third stamp there fails naming both polygons")
     check(rep["evidence"]["PT-ZIP"] == [],
           "a failed point adds no evidence")
-    rep = prun([pt(14, (0.0, 0.0), {"ZIP": "34482"}), pa])
-    check(rep["evidence"]["PT-ZIP"] == ["34482"],
+    rep = prun([pt(14, (0.0, 0.0), {"ZIP": "10003"}), pa])
+    check(rep["evidence"]["PT-ZIP"] == ["10003"],
           "an agreeing boundary point is evidence for the stamp it chose, "
           "not the first polygon the layer lists")
 
-    rep = prun([pt(15, None, {"ZIP": "34475"}), pa, pb])
+    rep = prun([pt(15, None, {"ZIP": "10001"}), pa, pb])
     check(rep["counts"]["skipped"] == 1 and rep["counts"]["compared"] == 2,
           "an unlocated point is skipped and counted, not compared")
 
@@ -2128,8 +2183,8 @@ def self_test():
         [poly("RIVERTON", -500.0, -500.0, 500.0, 500.0, "MUNI")]), "MUNI")
     two_rules = prules + pmuni
     found_two = points_from_geojson(points_fc([
-        pt(19, (-100.0, 0.0), {"ZIP": "34482", "MUNI": "RIVERTON"}),
-        pt(20, (100.0, 0.0), {"ZIP": "34475", "MUNI": "RIVERTON"})]))
+        pt(19, (-100.0, 0.0), {"ZIP": "10003", "MUNI": "RIVERTON"}),
+        pt(20, (100.0, 0.0), {"ZIP": "10001", "MUNI": "RIVERTON"})]))
     rep = evaluate_points(found_two, two_rules,
                           {"PT-ZIP": zip_layer, "PT-MUNI": one_muni})
     check(evidence_verdicts(rep["evidence"]) ==
@@ -2143,7 +2198,7 @@ def self_test():
           "2 needed [INSUFFICIENT]" in ptext,
           "the report names the rule that lacked evidence and what it saw")
     check("wrong column" in ptext, "and says why in words")
-    rep = prun([pa, pb, pt(21, None, {}), pt(22, (0.0, 0.0), {"ZIP": "34475"})])
+    rep = prun([pa, pb, pt(21, None, {}), pt(22, (0.0, 0.0), {"ZIP": "10001"})])
     ptext = "\n".join(describe_points(rep))
     check("1 skipped: no location" in ptext, "a skipped point is reported")
     check("1 stamp(s) on a shared boundary" in ptext,
@@ -2155,10 +2210,10 @@ def self_test():
     rep = prun([pt(23, (1000.0, 0.0), {"ZIP": ""})])
     check("agreement rate: none" in "\n".join(describe_points(rep)),
           "a run that decided no stamp has no agreement rate")
-    rep = prun([pa, pb] + [pt(30 + i, (-100.0, 50.0), {"ZIP": "34475"})
+    rep = prun([pa, pb] + [pt(30 + i, (-100.0, 50.0), {"ZIP": "10001"})
                            for i in range(3)])
     check(rep["rollup"][0]["count"] == 3 and
-          "stamped '34475' where the point is '34482' [mismatch]" in
+          "stamped '10001' where the point is '10003' [mismatch]" in
           "\n".join(describe_points(rep)),
           "three identical mismatches roll up into one group, worded as a "
           "point")
@@ -2209,8 +2264,8 @@ def self_test():
             return path
 
         zip_path = put("zips.geojson", {"type": "FeatureCollection", "features": [
-            poly("34482", -500.0, -500.0, 0.0, 500.0),
-            poly("34475", 0.0, -500.0, 500.0, 500.0)]})
+            poly("10003", -500.0, -500.0, 0.0, 500.0),
+            poly("10001", 0.0, -500.0, 500.0, 500.0)]})
         rules_path = put("rules.json", {"checks": [{
             "id": "SIDE-ZIP", "label": "ZIP boundary", "left_field": "ZIP_L",
             "right_field": "ZIP_R", "polygons": "zips.geojson",
@@ -2223,8 +2278,8 @@ def self_test():
                                          "features": [same, same]})
         degrees_path = put("degrees.geojson", {"type": "FeatureCollection",
                                                "features": [
-            street(1, [(-82.14, 29.18), (-82.14, 29.19)],
-                   {"ZIP_L": "34482", "ZIP_R": "34475"})]})
+            street(1, [(-20.14, 15.18), (-20.14, 15.19)],
+                   {"ZIP_L": "10003", "ZIP_R": "10001"})]})
         out_path = os.path.join(tmp, "report.json")
 
         def run_cli(extra):
@@ -2368,11 +2423,11 @@ def self_test():
             "placeholder": "99999"}]})
         pts_ok = put("pts_ok.geojson", points_fc([pa, pb]))
         pts_flat = put("pts_flat.geojson", points_fc([
-            pa, pt(3, (-200.0, 10.0), {"ZIP": "34482"})]))
+            pa, pt(3, (-200.0, 10.0), {"ZIP": "10003"})]))
         pts_bad = put("pts_bad.geojson", points_fc([
-            pa, pb, pt(4, (-100.0, 50.0), {"ZIP": "34475"})]))
+            pa, pb, pt(4, (-100.0, 50.0), {"ZIP": "10001"})]))
         pts_nofield = put("pts_nofield.geojson", points_fc([
-            pt(1, (-100.0, 0.0), {"ZIPCODE": "34482"})]))
+            pt(1, (-100.0, 0.0), {"ZIPCODE": "10003"})]))
         pts_multi = put("pts_multi.geojson", {"type": "FeatureCollection",
                                               "features": [{
             "properties": {}, "geometry": {"type": "MultiPoint",
@@ -2428,7 +2483,7 @@ def self_test():
         with open(pts_out, "r", encoding="utf-8") as handle:
             written = json.load(handle)
         check(written["mode"] == "points" and
-              written["evidence"] == {"PT-ZIP": ["34475", "34482"]} and
+              written["evidence"] == {"PT-ZIP": ["10001", "10003"]} and
               len(written["findings"]) == 1 and written["rollup"],
               "and it carries the mode, the evidence, the findings and the "
               "rollup")
@@ -2436,14 +2491,14 @@ def self_test():
         # Points mode has no offset, so lat/lon data is not at risk of a
         # ten-unit step through 690 miles of somewhere else.
         put("dzips.geojson", {"type": "FeatureCollection", "features": [
-            poly("34482", -82.30, 29.0, -82.15, 29.4),
-            poly("34475", -82.15, 29.0, -82.00, 29.4)]})
+            poly("10003", -20.30, 15.0, -20.15, 15.4),
+            poly("10001", -20.15, 15.0, -20.00, 15.4)]})
         drules = put("drules.json", {"checks": [{
             "id": "PT-ZIP", "point_field": "ZIP", "polygons": "dzips.geojson",
             "polygon_field": "ZIP"}]})
         dpts = put("dpts.geojson", points_fc([
-            pt(1, (-82.20, 29.2), {"ZIP": "34482"}),
-            pt(2, (-82.05, 29.2), {"ZIP": "34475"})]))
+            pt(1, (-20.20, 15.2), {"ZIP": "10003"}),
+            pt(2, (-20.05, 15.2), {"ZIP": "10001"})]))
         check(run_pts([dpts, "--rules", drules]) == 0,
               "lat/lon points run without a geographic refusal, since there "
               "is no offset to misapply")
@@ -2454,6 +2509,20 @@ def self_test():
 
 
 # ----------------------------------------------------------------------- cli
+
+class _Parser(argparse.ArgumentParser):
+    """An ArgumentParser whose usage errors exit 64, as _usage() does.
+
+    argparse exits 2 on its own rejections: an unknown flag, a refused prefix
+    such as --ap, a non-numeric --offset, a missing value. This tool uses 2 for
+    "an input could not be read", so a scheduled job branching on the code
+    would send a mistyped flag to whoever owns the data file.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, "%s: error: %s\n" % (self.prog, message))
+
 
 class _Given(argparse.Action):
     """Store a value and note that the flag was typed.
@@ -2469,7 +2538,7 @@ class _Given(argparse.Action):
 
 
 def _parse(argv):
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog="sidestamp.py",
         allow_abbrev=False,
         description="Check each side of a centerline, or the stamp on each "
@@ -2516,7 +2585,22 @@ def _parse(argv):
 
 def _usage(message):
     print("error: %s" % message, file=sys.stderr)
-    return 64
+    return EXIT_USAGE
+
+
+def _pass_line(noun, lower, tail):
+    """The exit 0 verdict. Exit 0 means no ERROR, which is not no finding.
+
+    A placeholder reports at WARNING by default, and a rule can demote any
+    tier to INFO, so a run can print findings and still pass. Saying that every
+    stamp agrees above a list of 47 placeholders would be false.
+    """
+    if lower:
+        head = ("no %s has an ERROR finding, and %d lower tier finding(s) "
+                "are listed above" % (noun, lower))
+    else:
+        head = "every %s agrees" % noun
+    return "PASS: %s, %s" % (head, tail)
 
 
 def main(argv=None):
@@ -2610,8 +2694,9 @@ def main(argv=None):
         lines = describe_points(report)
         code = gate_points(report)
         verdicts = {
-            0: "PASS: every stamp agrees, and the agreeing points front more "
-               "than one value per rule, so the run could have failed.",
+            0: _pass_line("stamp", len(report["findings"]),
+                          "and the agreeing points front more than one value "
+                          "per rule, so the run could have failed."),
             3: "INSUFFICIENT: no stamp disagreed, and the points could not "
                "have shown a wrong column or a wrong layer. This is not a "
                "clean run.",
@@ -2632,8 +2717,9 @@ def main(argv=None):
         lines = describe(report, args.dense)
         code = gate(report)
         verdicts = {
-            0: "PASS: every side agrees, and the run contained segments that "
-               "could have shown otherwise.",
+            0: _pass_line("side", len(report["findings"]),
+                          "and the run contained segments that could have "
+                          "shown otherwise."),
             3: "INSUFFICIENT: no side disagreed, and no segment in this run "
                "could have disagreed. This is not a clean run.",
             1: "FAIL: sides disagree with the polygons they front."}
