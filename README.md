@@ -4,8 +4,8 @@ Check the ZIP, ESN, city and municipality stamped on each side of a road centerl
 address point, against the polygon it actually fronts, and refuse to call a run clean when nothing
 in it could have disagreed.
 
-A road runs north along a ZIP code boundary. The left ZIP field says 34475 and the right ZIP field
-says 34475. The west side of that road is in 34482. Every address on it geocodes to a ZIP the
+A road runs north along a ZIP code boundary. The left ZIP field says 10001 and the right ZIP field
+says 10001. The west side of that road is in 10003. Every address on it geocodes to a ZIP the
 Postal Service does not use for that street, the MSAG range is built from the same attribution, and
 the 911 dispatch that reads the centerline sends the call to the wrong area.
 
@@ -14,7 +14,7 @@ between them, and it carries a separate attribute for each side. A spatial join 
 the polygons it touches, and the polygon it touches is not the polygon on the left.
 
 Address points have the quieter version of the same trap. A nightly job audits the ZIP stamped on
-the address points of one subdivision. All 240 points carry 34475, and all 240 sit in the 34475
+the address points of one subdivision. All 240 points carry 10001, and all 240 sit in the 10001
 polygon. The report says zero mismatches. Point the job at the wrong column, or at a layer that
 holds only that one polygon, and it prints the same report. Rename the column in the export, and
 a rules file that still names the old one reads every point as blank. Nothing in a run like that
@@ -40,7 +40,7 @@ PASS  a float ZIP loses its trailing .0, or it never equals the text ZIP  <-- pi
 PASS  a point inside a null-keyed polygon returns empty, not None  <-- pinned defect
 PASS  the dense sweep skips the fraction where the spur folds, and says it took 8 samples rather than 9  <-- pinned defect
 ...
-PASS  a side stamped 34475 fronting 34482 is a mismatch  <-- pinned defect
+PASS  a side stamped 10001 fronting 10003 is a mismatch  <-- pinned defect
 PASS  the 99999 placeholder is its own tier, not a wrong ZIP  <-- pinned defect
 PASS  a blank field where the layer covers nothing is a conservative miss  <-- pinned defect
 PASS  a blank on a layer declaring outside_default fires  <-- pinned defect
@@ -53,7 +53,7 @@ PASS  a rule whose two sides read one field is refused  <-- pinned defect
 PASS  two rules sharing an id are refused  <-- pinned defect
 PASS  switching off a tier severity is refused  <-- pinned defect
 ...
-PASS  and it is the left side, fronting 34482, stamped 34475  <-- pinned defect
+PASS  and it is the left side, fronting 10003, stamped 10001  <-- pinned defect
 PASS  a placeholder demote and a genuine mismatch land in one run  <-- pinned defect
 PASS  the systematic drift of 6 sides sorts above the one-offs  <-- pinned defect
 PASS  and tied groups are ordered by field, so two runs diff cleanly  <-- pinned defect
@@ -70,7 +70,7 @@ PASS  the dense sweep accepts a stamp naming one of the two ZIPs the side fronts
 PASS  and still reports both sides as spanning two polygons, because the split is owed whether or not the stamp is defensible  <-- pinned defect
 PASS  a stamp naming neither ZIP on a side spanning two is ambiguous and not defensible  <-- pinned defect
 PASS  the ambiguous record carries the remedy, not a verdict  <-- pinned defect
-PASS  an ambiguous side produces no finding, right or wrong  <-- pinned defect
+PASS  a stamp naming neither ZIP on a side spanning two is a finding, grouped under both  <-- pinned defect
 ...
 PASS  a zero length segment is skipped and counted  <-- pinned defect
 PASS  a spur that folds at its midpoint has length, so its two sides are counted unsampled rather than the segment skipped  <-- pinned defect
@@ -93,7 +93,6 @@ PASS  an infinite offset is refused  <-- pinned defect
 PASS  an absolute polygons path is read as given  <-- pinned defect
 PASS  a disabled rule does not need its layer to exist  <-- pinned defect
 PASS  a report that could not be written exits 2, not 1  <-- pinned defect
-PASS  a NaN or infinite coordinate, which json.load accepts, is an unlocated point and not a coverage gap  <-- pinned defect
 PASS  a rules file mixing point and road rules is refused, not half run  <-- pinned defect
 PASS  a point layer missing the field a rule reads is refused, naming the rule, the field and the count  <-- pinned defect
 PASS  a clean points run that could not have failed exits 3, not 0  <-- pinned defect
@@ -103,17 +102,21 @@ PASS  a unique prefix of --points is refused by the parser  <-- pinned defect
 PASS  --dense in points mode is refused, not ignored  <-- pinned defect
 PASS  and typing the default offset is still refused  <-- pinned defect
 ...
+PASS  a rule that decided no side exits 3 even when another rule settled the sign  <-- pinned defect
+PASS  streets with a vertex of nulls exit 2, not a traceback  <-- pinned defect
+PASS  a value outside the console code page prints escaped and the run still exits 1, not with a traceback  <-- pinned defect
 ----------------------------------------------------------------------
-350 assertions, 0 failed
+390 assertions, 0 failed
 ```
 
-The same 350 assertions pass on Windows with Python 3.13 and on Linux with Python 3.12, and the two
-runs print identical text. Branch coverage of `sidestamp.py` is 100%, measured with
-`coverage run --branch sidestamp.py --self-test` on Windows (see Limits for the one excluded line).
+The same 390 assertions pass on Windows with Python 3.13, 3.12 and 3.9, and on Linux with Python
+3.12 and 3.9. The Windows 3.13 and Linux 3.12 runs print identical text once line endings are
+normalized. Statement and branch coverage of `sidestamp.py` is 100%, measured with
+`coverage run --branch sidestamp.py --self-test` on Windows (see Limits for the excluded lines).
 
 ## Requirements
 
-Python 3.9 or later. Standard library only: `argparse`, `json`, `math`, `os`, `sys`, and
+Python 3.9 or later. Standard library only: `argparse`, `collections`, `json`, `math`, `os`, `sys`, and
 `contextlib`, `io`, `shutil` and `tempfile` for the self-test's own temporary files. No `arcpy`, no
 `shapely`, no `pyproj`, no network and no credentials. It runs the same on ArcGIS Pro's Python and
 on a plain `python3`.
@@ -176,7 +179,8 @@ it names move together.
 | `placeholder_severity` | `WARNING` | Severity of the placeholder tier. |
 | `blank_severity` | `severity` | Severity of a blank field the polygon can name. |
 
-A real run against 360 segments, 96 of them stamped with the ZIP on the far side of the road:
+A real run against 360 synthetic segments, 96 of them stamped with the ZIP on the far side of the
+road. The fixture is generated, not real data.
 
 ```
 $ python sidestamp.py --streets streets.geojson --rules rules.json --dense
@@ -193,11 +197,11 @@ findings: 134
   WARNING  28
 
 groups, largest first:
-    96  SIDE-ZIP ZIP_L stamped '34475' where the side is '34482' [mismatch]
+    96  SIDE-ZIP ZIP_L stamped '10001' where the side is '10003' [mismatch]
         sample ids: 1, 2, 3, 4, 5
-    14  SIDE-ZIP ZIP_L stamped '99999' where the side is '34475' [placeholder]
+    14  SIDE-ZIP ZIP_L stamped '99999' where the side is '10001' [placeholder]
         sample ids: 337, 338, 339, 340, 341
-    14  SIDE-ZIP ZIP_R stamped '99999' where the side is '34475' [placeholder]
+    14  SIDE-ZIP ZIP_R stamped '99999' where the side is '10001' [placeholder]
         sample ids: 337, 338, 339, 340, 341
      3  SIDE-MUNI MUNI_L stamped 'RIVERTON' where the side is 'UNINCORPORATED' [mismatch]
         sample ids: 351, 352, 353
@@ -208,8 +212,12 @@ groups, largest first:
      2  SIDE-MUNI MUNI_R stamped '' where the side is 'RIVERTON' [blank]
         sample ids: 354, 355
 
-ambiguous sides, no verdict given:
-  OBJECTID 356 SIDE-ZIP: left side spans 2 ZIP boundary polygons (34475, 34479) and is stamped '34475', which is one of them; split the centerline at the boundary
+rule check: PASS
+  SIDE-MUNI: 718 decided side(s) [PASS]
+  SIDE-ZIP: 718 decided side(s) [PASS]
+
+sides spanning more than one polygon, split owed:
+  OBJECTID 356 SIDE-ZIP: left side spans 2 ZIP boundary polygons (10001, 10003) and is stamped '10001', which is one of them; split the centerline at the boundary
   ...
 
 probe sign check: PASS
@@ -231,16 +239,50 @@ sides compared: 960
 
 findings: 0
 
+rule check: PASS
+  SIDE-MUNI: 480 decided side(s) [PASS]
+  SIDE-ZIP: 480 decided side(s) [PASS]
+
 probe sign check: INSUFFICIENT
   0 segment(s) front different polygons on their two sides and so could disprove the offset direction
   Nothing in this run could have failed on side direction. A left/right swap would give the same answer.
 
-INSUFFICIENT: no side disagreed, and no segment in this run could have disagreed. This is not a clean run.
+INSUFFICIENT: no side disagreed, and the run could not have shown one: no segment fronted two different polygons, or a rule decided no side. This is not a clean run.
 ```
 
 That second run is the point of the tool. Nothing in it is wrong, and it proves nothing. Every
 segment carries the same value on both sides, so swapping left for right would print the same
 report. It exits 3, not 0.
+
+The probe sign check is global, because the offset direction does not depend on the rule. Whether a
+rule reached any side does. This run holds five correctly stamped seam roads, so the sign check
+passes. Its second rule names street fields that are not on the file, over a layer that covers none
+of the streets, so every side it reads is a conservative miss:
+
+```
+$ python sidestamp.py --streets seam_ok.geojson --rules typo_rules.json
+segments read: 5
+sides compared: 20
+  agreement: 10 of 10 decided sides, 100.00%
+  conservative misses: 10 blank sides where the layer covers nothing
+  ambiguous: 0 side(s) spanning more than one polygon (single sample, run --dense to find these)
+
+findings: 0
+
+rule check: INSUFFICIENT
+  SIDE-MUNI: 0 decided side(s) [INSUFFICIENT]
+  SIDE-ZIP: 10 decided side(s) [PASS]
+  A rule that decided no side would print the same report if its fields were misspelled or its layer missed the streets.
+
+probe sign check: PASS
+  5 segment(s) front different polygons on their two sides and so could disprove the offset direction
+  5 of those match the right side, 0 match the left
+
+INSUFFICIENT: no side disagreed, and the run could not have shown one: no segment fronted two different polygons, or a rule decided no side. This is not a clean run.
+```
+
+One rule that decides sides does not vouch for another that decides none. It exits 3, not 0. When
+the layer does cover the streets, the same typo reads every side as blank and fails the run.
 
 | Flag | Default | What it does |
 |---|---|---|
@@ -258,6 +300,9 @@ report. It exits 3, not 0.
 
 Exit codes: 0 the run was clean and could have failed, 1 findings at ERROR or a flipped probe,
 2 an input could not be read, 3 the run proved nothing, 64 usage error.
+
+An input counts as unreadable when the file is missing, is not JSON, or is JSON that is not the GeoJSON
+this tool reads, such as a feature that is null or a position of nulls.
 
 ### Points mode
 
@@ -315,23 +360,23 @@ findings: 65
   WARNING  12
 
 groups, largest first:
-    40  PT-ZIP ZIP stamped '34482' where the point is '34475' [mismatch]
-        sample ids: 301, 302, 303, 304, 305
-    12  PT-ZIP ZIP stamped '99999' where the point is '34475' [placeholder]
-        sample ids: 341, 342, 343, 344, 345
-     8  PT-ZIP ZIP stamped '' where the point is '34475' [blank]
-        sample ids: 353, 354, 355, 356, 357
-     5  PT-ZIP ZIP stamped '34479' where the point is '(outside all)' [mismatch]
-        sample ids: 371, 372, 373, 374, 375
+    40  PT-ZIP ZIP stamped '10003' where the point is '10001' [mismatch]
+        sample ids: 1, 2, 3, 4, 5
+    12  PT-ZIP ZIP stamped '99999' where the point is '10001' [placeholder]
+        sample ids: 41, 42, 43, 44, 45
+     8  PT-ZIP ZIP stamped '' where the point is '10001' [blank]
+        sample ids: 53, 54, 55, 56, 57
+     5  PT-ZIP ZIP stamped '10002' where the point is '(outside all)' [mismatch]
+        sample ids: 65, 66, 67, 68, 69
 
 discrimination check: PASS
   PT-MUNI: agreeing points front 2 distinct value(s) (RIVERTON, UNINCORPORATED), 2 needed [PASS]
-  PT-ZIP: agreeing points front 3 distinct value(s) (34475, 34479, 34482), 2 needed [PASS]
+  PT-ZIP: agreeing points front 3 distinct value(s) (10001, 10002, 10003), 2 needed [PASS]
 
 FAIL: stamps disagree with the polygons the points fall in.
 ```
 
-The same rules over 240 points that are every one correctly stamped, all in one ZIP:
+The same rules over 240 points that are every one correctly stamped, all in one ZIP and none in the municipality:
 
 ```
 $ python sidestamp.py --points interior_points.geojson --rules point_rules.json
@@ -344,7 +389,7 @@ findings: 0
 
 discrimination check: INSUFFICIENT
   PT-MUNI: agreeing points front 1 distinct value(s) (UNINCORPORATED), 2 needed [INSUFFICIENT]
-  PT-ZIP: agreeing points front 1 distinct value(s) (34475), 2 needed [INSUFFICIENT]
+  PT-ZIP: agreeing points front 1 distinct value(s) (10001), 2 needed [INSUFFICIENT]
   A rule marked INSUFFICIENT would print the same report for a stamp read from the wrong column.
 
 INSUFFICIENT: no stamp disagreed, and the points could not have shown a wrong column or a wrong layer. This is not a clean run.
@@ -381,12 +426,17 @@ It exits 2 and writes nothing. Without this assertion the 3 points would read as
   the fraction, so a coverage hole cannot move the rate without moving the data.
 - **Sides that span more than one polygon.** With `--dense`, nine points are sampled along each
   side. A side fronting two polygons has no single right answer and the centerline should be split
-  at the boundary. The report says so and gives no verdict. A stamp naming one of the two is still
-  accepted, because the stamp describes the side and not the midpoint, but the split is still owed.
+  at the boundary. The report lists these sides and says the split is owed. A stamp naming one of
+  the two is accepted, because the stamp describes the side and not the midpoint. A stamp naming
+  neither is an ERROR finding, grouped under both polygons.
 - **Whether the run could have failed at all.** Only a segment whose two sides front different
   polygons can show that the probe reached the correct side. On every other segment a left for
   right swap gives the same answer. The run reports how many such segments it held, how many of
   them settled the question, and exits 3 when the answer is none.
+- **Whether each road rule decided anything.** A rule must decide at least one side, meaning one
+  that agreed or became a finding. A rule whose side fields are not on the streets, or whose layer
+  covers none of them, decides nothing, and the run exits 3 naming it even when another rule
+  settled the sign.
 - **The probe's handedness.** Among the segments that settle it, the stored right value should match
   the right probe. When it matches the left more often, the report says FLIPPED and the run fails,
   because every finding in it is on the wrong side. Equal counts are not a pass. As many segments
@@ -402,15 +452,15 @@ It exits 2 and writes nothing. Without this assertion the 3 points would read as
 - **Whether a points run could have failed.** For each rule, the points that agree must front at
   least two distinct values. A run whose agreeing points all sit in one polygon would print the same
   report for a stamp read from the wrong column, and exits 3. A point that fails does not count as
-  evidence, and neither does a placeholder.
+  evidence, and a placeholder can never agree.
 - **The field must be on the points.** A rule's `point_field` has to be a property of every point in
   the file. A missing property exits 2, naming the rule, the field and the first ids. A property
   that is present and null is a real blank.
 - **Points with no location.** A null geometry, an empty position, or a NaN or infinite coordinate is
   skipped and counted. A MultiPoint is refused.
 - **Groups, not rows.** Findings collapse into the distinct pairs of stored value and containing
-  value, sorted by count descending, so one row saying 96 sides fronting ZIP 34482 are stamped
-  34475 sits above the one-off boundary segments. Ties are ordered by rule and field, so two runs
+  value, sorted by count descending, so one row saying 96 sides fronting ZIP 10003 are stamped
+  10001 sits above the one-off boundary segments. Ties are ordered by rule and field, so two runs
   can be diffed.
 
 Run a check for a road crossing a boundary without being split before this one. This tool samples
@@ -452,8 +502,10 @@ tool, and this tool does not audit an export script. It does catch what they lea
 - **Defaults that look like data.** `99999` in a ZIP column and `UNINCORPORATED` in a municipality
   column are valid-looking values that mean "nothing was found". `placeholder` reports the first on
   its own tier, at WARNING, so thousands of them do not bury the real mismatches. `outside_default`
-  declares the second and checks it only where a point is outside every polygon. Neither counts as
-  evidence that the lookup works.
+  declares the second and checks it only where a point is outside every polygon. A placeholder
+  never counts as evidence that the lookup works. A point outside every polygon that is stamped
+  with `outside_default` does count as one value, because it agrees with what the layer says
+  outside, and a stamp read from the wrong column would not match it.
 
 To find the unmatched targets in the join itself, keep all targets (Spatial Join's default is an
 outer join) and count the rows with no match. The docs give `-1` in `JOIN_FID` as the sign of no
@@ -485,20 +537,60 @@ match for a one to many join. Run points mode on the result.
 - Points mode is plane geometry too, and nothing is reprojected. It has no offset, so it does not
   refuse lat/lon points. Points and polygons in different systems are not detected: the points land
   outside every polygon and report as mismatches or conservative misses.
-- The required-field assertion is points mode only. A road rule whose `left_field` is not on the
-  streets still reads every side as blank. Nothing checks that a polygon layer carries its
-  `polygon_field` either; a layer without it reads every polygon as a blank value, which shows up
-  loudly as findings.
+- The required-field assertion is points mode only. A road rule whose `left_field` or
+  `right_field` is not on the streets reads every side as blank. With default severities that fails
+  with exit 1 where the layer covers the streets, and exits 3 through the rule check where it
+  covers none of them. With `blank_severity` set to `INFO` the blanks are listed and do not fail
+  the run, so the exit code then comes from the sign check. Nothing checks that a polygon layer
+  carries its `polygon_field` either; a layer without it reads every polygon as a blank value,
+  which shows up loudly as findings.
 - Two distinct values is a floor. It shows the lookup can tell two places apart, not that it is
   right in a third. Points in a layer of overlapping polygons accept the stamp of any polygon that
   holds them.
-- Coverage is 100% of branches on Windows. One line is excluded with `# pragma: no cover`: the
-  `if __name__ == "__main__":` guard, which only runs when the file is launched as a script. The
-  Linux host does not have `coverage` installed, so coverage was measured on Windows only; the
-  self-test output on Linux is identical text.
+- Coverage is 100% of statements and branches on Windows. Two lines are excluded with
+  `# pragma: no cover`: the `if __name__ == "__main__":` guard and the `sys.exit(main())` call under
+  it, which only run when the file is launched as a script. The Linux host does not have `coverage`
+  installed, so coverage was measured on Windows only; the self-test output on Linux is identical
+  text.
+- The quoted runs came from generated synthetic fixtures that are not shipped, because the
+  repository holds four files. The self-test builds its own fixtures and needs none.
+- The self-test counts 390 assertions on every interpreter listed above. It has no
+  platform-dependent branch, so the count has no unavoidable difference between hosts.
 - The agreement rate describes this run against these layers. It is not a quality score for the
   data, and a high rate with an INSUFFICIENT sign check says only that the run could not fail.
 - It never fixes a row. It classifies, groups, reports and exits.
+- Stamps are compared as exact text after trimming and upper-casing. A ZIP+4 such as `10001-1234`
+  against a 5-digit polygon key, a numeric ZIP that lost its leading zero against a text key, and an
+  accent in NFC against the same accent in NFD all report as mismatches, never as agreements.
+  Reduce a ZIP+4 stamp to five digits and store identifiers as text before the run.
+- A polygon ring with fewer than 3 positions is dropped silently, and a point inside such a polygon
+  then reads as outside the layer.
+- A polygon feature with a null geometry makes the whole polygon layer unreadable (exit 2), while a
+  point with a null geometry is skipped and counted. Clean an empty-geometry row out of a polygon
+  layer first.
+- A point that lacks the rule's field makes the whole run exit 2, instead of reading as blank.
+  Export every point with the column present, even when its value is null.
+- Coordinates that all fit inside +-180 and +-90 are treated as degrees, and an `--offset` of 0.01
+  or more is refused with exit 64. A small local grid in feet or metres whose coordinates all fall
+  inside that envelope exits 64 with the default offset, so shift its origin first.
+- Duplicate feature ids are accepted. Findings are reported under the id as given, so two features
+  with the same id cannot be told apart in the sample ids.
+- With `--apply`, `--out` is written over whatever file it names, including the streets, points,
+  rules or polygon file. Nothing checks that it differs from an input. The report is written
+  straight to `--out`, not to a temporary file that is renamed, so a write that fails partway can
+  leave a short file and the run exits 2.
+- The `polygons` path is joined as typed. A rules file written on Windows with a backslash in a
+  relative path is not found on Linux, and the run exits 2 naming the path. A rule may also name an
+  absolute path or one that contains `..`, and the tool reads it, so run only rules files you trust.
+- A stored value outside the console code page is printed with backslash escapes, so the report
+  and the exit code survive. The JSON report written with `--apply` keeps the value as given.
+- Mutation sweep: 295 sites in the core, 88 in the rule and GeoJSON I/O and 60 in `main` were
+  mutated. About 25 survivors are equivalent or display only (counters, truncation limits such as
+  `[:20]` and `[:10]`, and `return None` against `return False`). The count shown as `points read`
+  and the per-severity counts are not pinned by any assertion. Unpinned boundary mutants are the
+  `label or polygon_field` label text, `--sample 1`, the 0.01 geographic offset boundary, a
+  3-vertex polygon ring, the rollup `rule` key in the JSON report, the empty-string rule id, and
+  `sort_keys` and `indent` in the written report.
 - GeoJSON in, JSON out. There is no geodatabase reader and no feature service client. Export first.
 
 ## Sources

@@ -113,6 +113,13 @@ REQUIRED_POINT_KEYS = ("id", "point_field", "polygon_field")
 # points run can be called clean. One value is the case that proves nothing.
 MIN_DISTINCT = 2
 
+# What a file that is valid JSON but not the GeoJSON this tool reads raises
+# while it is parsed: a null where an object belongs, a short position, an
+# integer too large for a float. All of them are an unreadable input (exit 2),
+# not a crash, which would exit 1 and read as "findings at ERROR".
+MALFORMED = (TypeError, KeyError, IndexError, AttributeError, OverflowError,
+             RecursionError)
+
 # The exit code for a mistake in the command line or the rules file, as opposed
 # to 2, which means an input file could not be read.
 EXIT_USAGE = 64
@@ -425,6 +432,7 @@ def evaluate(streets, rules, polys_by_rule, offset=DEFAULT_OFFSET, dense=False,
               "unsampled": 0, "ambiguous": 0, "ambiguous_defensible": 0}
     sign = {"discriminating": 0, "right_match": 0, "left_as_right": 0}
     active = [r for r in rules if r.get("enabled", True)]
+    decided = dict((r["id"], 0) for r in active)
 
     for street in streets:
         counts["segments"] += 1
@@ -477,6 +485,7 @@ def evaluate(streets, rules, polys_by_rule, offset=DEFAULT_OFFSET, dense=False,
                 if tier == "gap":
                     counts["gap"] += 1
                     continue
+                decided[rule["id"]] += 1
                 if desc is None:
                     counts["agree"] += 1
                     continue
@@ -497,7 +506,7 @@ def evaluate(streets, rules, polys_by_rule, offset=DEFAULT_OFFSET, dense=False,
             _tally_sign(sign, street, rule, probes)
 
     return {"findings": findings, "ambiguous": ambiguous, "counts": counts,
-            "sign": sign, "rollup": rollup(findings)}
+            "sign": sign, "decided": decided, "rollup": rollup(findings)}
 
 
 def _tally_sign(sign, street, rule, probes):
@@ -574,18 +583,32 @@ def sign_verdict(sign):
     return "PASS"
 
 
+def undecided_rules(report):
+    """Ids of the enabled road rules that decided no side, sorted.
+
+    The sign check is global, because the probe's handedness does not depend on
+    the rule. Whether a rule's own fields and layer reached any side does. A
+    rule whose side fields are not on the streets, or whose layer covers none
+    of them, reads every side as a conservative miss and decides nothing, and
+    one rule that decides sides must not vouch for another that does not.
+    """
+    return sorted(rid for rid, n in report["decided"].items() if n == 0)
+
+
 def gate(report):
     """Exit code for a finished run.
 
-    3 outranks 0 and yields to 1. A run with no discriminating segment cannot
-    be called clean, but a run that already found errors has something to say
-    and says it.
+    3 outranks 0 and yields to 1. A run with no discriminating segment, or with
+    a rule that decided no side, cannot be called clean, but a run that already
+    found errors has something to say and says it.
     """
     if any(f["severity"] == "ERROR" for f in report["findings"]):
         return 1
     if sign_verdict(report["sign"]) == "FLIPPED":
         return 1
     if sign_verdict(report["sign"]) == "INSUFFICIENT":
+        return 3
+    if undecided_rules(report):
         return 3
     return 0
 
@@ -658,6 +681,18 @@ def describe(report, dense):
                    "owed" % counts["ambiguous_defensible"])
 
     out.extend(_findings_lines(report, "side"))
+
+    out.append("")
+    out.append("rule check: %s" % ("INSUFFICIENT" if undecided_rules(report)
+                                   else "PASS"))
+    for rid in sorted(report["decided"]):
+        n = report["decided"][rid]
+        out.append("  %s: %d decided side(s) [%s]"
+                   % (rid, n, "PASS" if n else "INSUFFICIENT"))
+    if undecided_rules(report):
+        out.append("  A rule that decided no side would print the same report "
+                   "if its fields were misspelled or its layer missed the "
+                   "streets.")
 
     if report["ambiguous"]:
         out.append("")
@@ -859,6 +894,13 @@ def validate_rule(raw):
     for key in (REQUIRED_POINT_KEYS if is_point else REQUIRED_RULE_KEYS):
         if not raw.get(key):
             raise ValueError("rule %s: '%s' is required" % (rid, key))
+    for key in ("left_field", "right_field", "point_field", "polygon_field",
+                "polygons"):
+        if key in raw and not isinstance(raw[key], str):
+            # A list or a number here is not a field name. It would reach the
+            # property lookup or the path join and end in a traceback.
+            raise ValueError("rule %s: '%s' must be a text value, got %r"
+                             % (rid, key, raw[key]))
     if not isinstance(raw.get("enabled", True), bool):
         # A null or a string is not false. rule.get("enabled", True) would
         # read a null as off and a string as on, so a template left with
@@ -1467,6 +1509,28 @@ def self_test():
                                            "polygon_field": "Z",
                                            "severity": "LOUD"}]}),
            "an unknown severity is refused")
+    raises(lambda: load_rules({"checks": [{"id": "A", "left_field": "L",
+                                           "right_field": "R",
+                                           "polygon_field": "Z",
+                                           "enabled": None}]}),
+           "a rule with \"enabled\": null is refused, not switched off  "
+           "<-- pinned defect")
+    raises(lambda: load_rules({"checks": [{"id": "A", "left_field": "L",
+                                           "right_field": "R",
+                                           "polygon_field": "Z",
+                                           "enabled": "false"}]}),
+           "and a text \"false\" is refused, not read as on")
+    raises(lambda: load_rules({"checks": [{"id": "A", "left_field": ["L"],
+                                           "right_field": "R",
+                                           "polygon_field": "Z"}]}),
+           "a field name that is a list is refused, not looked up  "
+           "<-- pinned defect")
+    raises(lambda: load_rules({"checks": [{"id": "A", "left_field": "L",
+                                           "right_field": "R",
+                                           "polygon_field": "Z",
+                                           "polygons": 7}]}),
+           "a polygons path that is a number is refused, not joined  "
+           "<-- pinned defect")
 
     # The tier severity cannot be switched off on its own. Telling an analyst
     # to write "placeholder_severity: off" would send them to a knob that does
@@ -1702,6 +1766,58 @@ def self_test():
     check(sign_verdict(rep["sign"]) == "INSUFFICIENT",
           "so the sign check counts evidence, not opportunities"
           "  <-- pinned defect")
+
+    # A road on the edge of the layer has one side inside a polygon and the
+    # other inside none. It cannot prove the sign, and the check must say so
+    # instead of indexing into the empty side.
+    edge_east = street(64, [(500.0, -100.0), (500.0, 100.0)],
+                       {"ZIP_L": "10001", "ZIP_R": ""})
+    edge_west = street(65, [(-500.0, -100.0), (-500.0, 100.0)],
+                       {"ZIP_L": "", "ZIP_R": "10003"})
+    rep = run([edge_east, edge_west])
+    check(rep["counts"]["agree"] == 2 and rep["counts"]["gap"] == 2,
+          "a road on the layer's edge agrees on its covered side and misses "
+          "conservatively on the other  <-- pinned defect")
+    check(rep["sign"]["discriminating"] == 0 and
+          sign_verdict(rep["sign"]) == "INSUFFICIENT",
+          "and one side outside every polygon cannot prove the sign  "
+          "<-- pinned defect")
+
+    # Two rules in one run. SIDE-ZIP decides sides and discriminates, so the
+    # sign check passes for the whole run. SIDE-TYPO reads fields that are not
+    # on the streets, over a layer that covers none of them, so every side it
+    # reads is a conservative miss and it decides nothing.
+    elsewhere = polygons_from_geojson(
+        {"type": "FeatureCollection",
+         "features": [poly("77777", 9000.0, 9000.0, 9500.0, 9500.0)]}, "ZIP")
+    typo = dict(zips)
+    typo.update({"id": "SIDE-TYPO", "left_field": "ZIP_L_TYPO",
+                 "right_field": "ZIP_R_TYPO"})
+    one_good = streets_from_geojson({"type": "FeatureCollection",
+                                     "features": [good]})
+    rep = evaluate(one_good, [zips, typo],
+                   {"SIDE-ZIP": zip_layer, "SIDE-TYPO": elsewhere})
+    check(rep["decided"] == {"SIDE-ZIP": 2, "SIDE-TYPO": 0},
+          "each rule counts the sides it decided")
+    check(sign_verdict(rep["sign"]) == "PASS" and not rep["findings"],
+          "the run's sign check passes on the other rule's evidence")
+    check(undecided_rules(rep) == ["SIDE-TYPO"],
+          "the rule that decided no side is named")
+    check(gate(rep) == 3,
+          "so a rule that decided nothing exits the run 3, not 0  "
+          "<-- pinned defect")
+    text = "\n".join(describe(rep, False))
+    check("rule check: INSUFFICIENT" in text and
+          "SIDE-TYPO: 0 decided side(s) [INSUFFICIENT]" in text and
+          "SIDE-ZIP: 2 decided side(s) [PASS]" in text,
+          "and the report names it beside the rule that did decide")
+    rep = evaluate(one_good, [zips, typo],
+                   {"SIDE-ZIP": zip_layer, "SIDE-TYPO": zip_layer})
+    check(gate(rep) == 1 and rep["decided"]["SIDE-TYPO"] == 2,
+          "the same misspelled fields over a layer that covers the streets "
+          "read blank and fail the run, which decided both sides")
+    check("rule check: PASS" in "\n".join(describe(run([good]), False)),
+          "a run where every rule decided a side reports the rule check PASS")
 
     # A flipped probe with no ERROR finding. The sides are swapped and the rule
     # emits at WARNING, so nothing but the sign check can fail the run.
@@ -2091,6 +2207,12 @@ def self_test():
     rep = prun([])
     check(rep["counts"]["points"] == 0 and gate_points(rep) == 3,
           "an empty points file proves nothing and exits 3")
+    all_off = [dict(prules[0], enabled=False)]
+    rep = prun([pa, pb], rules=all_off)
+    check(gate_points(rep) == 3 and "No rule was enabled, so no stamp was "
+          "checked." in "\n".join(describe_points(rep)),
+          "a points run with every rule disabled exits 3 and says no stamp "
+          "was checked  <-- pinned defect")
 
     rep = prun([pa, pb, pt(4, (-100.0, 50.0), {"ZIP": "10001"})])
     f = rep["findings"][0]
@@ -2502,6 +2624,109 @@ def self_test():
         check(run_pts([dpts, "--rules", drules]) == 0,
               "lat/lon points run without a geographic refusal, since there "
               "is no offset to misapply")
+
+        # ---- a rule that decided nothing, and a rule that is off
+        put("elsewhere.geojson", {"type": "FeatureCollection", "features": [
+            poly("77777", 9000.0, 9000.0, 9500.0, 9500.0)]})
+        typo_rules = put("typo_rules.json", {"checks": [
+            {"id": "SIDE-ZIP", "left_field": "ZIP_L", "right_field": "ZIP_R",
+             "polygon_field": "ZIP", "polygons": "zips.geojson"},
+            {"id": "SIDE-TYPO", "left_field": "ZIP_L_TYPO",
+             "right_field": "ZIP_R_TYPO", "polygon_field": "ZIP",
+             "polygons": "elsewhere.geojson"}]})
+        check(run_cli([clean_path, "--rules", typo_rules]) == 3,
+              "a rule that decided no side exits 3 even when another rule "
+              "settled the sign  <-- pinned defect")
+        null_enabled = put("null_enabled.json", {"checks": [{
+            "id": "A", "left_field": "ZIP_L", "right_field": "ZIP_R",
+            "polygon_field": "ZIP", "polygons": "zips.geojson",
+            "enabled": None}]})
+        check(run_cli([clean_path, "--rules", null_enabled]) == 64,
+              "a rule with \"enabled\": null exits 64, not a clean run  "
+              "<-- pinned defect")
+        all_off_rules = put("all_off.json", {"checks": [{
+            "id": "PT-ZIP", "point_field": "ZIP", "polygon_field": "ZIP",
+            "polygons": "zips.geojson", "enabled": False}]})
+        check(run_pts([pts_ok, "--rules", all_off_rules]) == 3,
+              "a points run with every rule off exits 3  <-- pinned defect")
+
+        # ---- valid JSON that is not the GeoJSON this tool reads is an
+        # unreadable input (exit 2). A traceback exits 1, which reads as
+        # findings at ERROR.
+        def feats(*items):
+            return {"type": "FeatureCollection", "features": list(items)}
+
+        def line_with(coords=None, props=None, geom="line"):
+            geometry = ({"type": "LineString", "coordinates": coords}
+                        if geom == "line" else geom)
+            return {"type": "Feature", "properties": props,
+                    "geometry": geometry}
+
+        malformed = [
+            ("a vertex of nulls", feats(line_with([[None, None], [0, 1]]))),
+            ("a one number vertex", feats(line_with([[1], [0, 1]]))),
+            ("a feature that is null", feats(None)),
+            ("properties that is text", feats(line_with(
+                [[0, 0], [0, 1]], props="x"))),
+            ("geometry that is text", feats(line_with(geom="x"))),
+            ("coordinates that is a number", feats(line_with(5))),
+            ("an integer too large for a float", feats(line_with(
+                [[10 ** 400, 0], [0, 1]]))),
+        ]
+        for name, obj in malformed:
+            path = put("malformed.geojson", obj)
+            check(run_cli([path, "--rules", rules_path]) == 2,
+                  "streets with %s exit 2, not a traceback  "
+                  "<-- pinned defect" % name)
+        bad_point = put("bad_point.geojson", feats({
+            "type": "Feature", "properties": {"ZIP": "10001"},
+            "geometry": {"type": "Point", "coordinates": {"x": 1, "y": 2}}}))
+        check(run_pts([bad_point, "--rules", prules_path]) == 2,
+              "a Point whose coordinates is an object exits 2  "
+              "<-- pinned defect")
+        for name, ring in (("null", None), ("an integer", 7)):
+            put("badring.geojson", feats({
+                "type": "Feature", "properties": {"ZIP": "10001"},
+                "geometry": {"type": "Polygon", "coordinates": [ring]}}))
+            put("badring_rules.json", {"checks": [{
+                "id": "A", "left_field": "ZIP_L", "right_field": "ZIP_R",
+                "polygon_field": "ZIP", "polygons": "badring.geojson"}]})
+            check(run_cli([clean_path, "--rules",
+                           os.path.join(tmp, "badring_rules.json")]) == 2,
+                  "a polygon ring that is %s exits 2  <-- pinned defect" % name)
+        with open(os.path.join(tmp, "deep.geojson"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("[" * 100000 + "]" * 100000)
+        check(run_cli([os.path.join(tmp, "deep.geojson"), "--rules",
+                       rules_path]) == 2,
+              "JSON nested past the recursion limit exits 2  "
+              "<-- pinned defect")
+        deep_rules = os.path.join(tmp, "deep.geojson")
+        check(run_cli([clean_path, "--rules", deep_rules]) == 2,
+              "and so does a rules file nested past it  <-- pinned defect")
+        for key, value in (("left_field", ["ZIP_L"]), ("polygons", 7)):
+            rule = {"id": "A", "left_field": "ZIP_L", "right_field": "ZIP_R",
+                    "polygon_field": "ZIP", "polygons": "zips.geojson"}
+            rule[key] = value
+            check(run_cli([clean_path, "--rules",
+                           put("typed.json", {"checks": [rule]})]) == 64,
+                  "a rule whose %s is not text exits 64  <-- pinned defect"
+                  % key)
+
+        # ---- a stored value the console cannot encode must not crash the
+        # report after the analysis is done
+        snow = put("snow.geojson", feats(street(
+            1, seam, {"ZIP_L": "\u2603", "ZIP_R": "10001"})))
+        sink = io.BytesIO()
+        console = io.TextIOWrapper(sink, encoding="cp1252", errors="strict")
+        with contextlib.redirect_stdout(console):
+            with contextlib.redirect_stderr(io.StringIO()):
+                code = main(["--streets", snow, "--rules", rules_path])
+        console.flush()
+        escaped = ("%su2603" % chr(92)).encode("ascii")
+        check(code == 1 and escaped in sink.getvalue(),
+              "a value outside the console code page prints escaped and the "
+              "run still exits 1, not with a traceback  <-- pinned defect")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -2603,8 +2828,21 @@ def _pass_line(noun, lower, tail):
     return "PASS: %s, %s" % (head, tail)
 
 
+def _survive_encoding():
+    """Make printing a stored value outside the console code page safe.
+
+    A stamped value such as U+2603 raises UnicodeEncodeError on a cp1252
+    console after the analysis is done, and the traceback exits 1, which reads
+    as findings. Backslash escapes keep the report and the exit code.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
+
+
 def main(argv=None):
     args = _parse(sys.argv[1:] if argv is None else argv)
+    _survive_encoding()
 
     if args.self_test:
         return self_test()
@@ -2642,7 +2880,7 @@ def main(argv=None):
 
     try:
         raw_rules = read_json(args.rules)
-    except (IOError, OSError, ValueError) as exc:
+    except (IOError, OSError, ValueError, RecursionError) as exc:
         # json.JSONDecodeError is a ValueError, so a rules file that is not
         # JSON lands here rather than in the validator below. A file that
         # cannot be parsed is an unreadable input; a file that parses but does
@@ -2687,6 +2925,12 @@ def main(argv=None):
         # error. The operator's command line was fine; the data is not.
         print("error: %s" % exc, file=sys.stderr)
         return 2
+    except MALFORMED as exc:
+        print("error: an input is valid JSON but not the GeoJSON this tool "
+              "reads (%s: %s). Every feature must be an object with a "
+              "'geometry' object, a 'properties' object or null, and numeric "
+              "positions." % (type(exc).__name__, exc), file=sys.stderr)
+        return 2
 
     if points_mode:
         report = evaluate_points(features, rules, polys_by_rule)
@@ -2720,8 +2964,9 @@ def main(argv=None):
             0: _pass_line("side", len(report["findings"]),
                           "and the run contained segments that could have "
                           "shown otherwise."),
-            3: "INSUFFICIENT: no side disagreed, and no segment in this run "
-               "could have disagreed. This is not a clean run.",
+            3: "INSUFFICIENT: no side disagreed, and the run could not have "
+               "shown one: no segment fronted two different polygons, or a "
+               "rule decided no side. This is not a clean run.",
             1: "FAIL: sides disagree with the polygons they front."}
 
     for line in lines:
